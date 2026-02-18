@@ -72,20 +72,20 @@ class JungleScoutClient:
             )
 
         try:
-            from junglescout import Client as _JSClient  # type: ignore[import]
-            from junglescout.models.params import ApiType  # type: ignore[import]
+            from junglescout import ClientSync  # type: ignore[import]
+            from junglescout.models.parameters import ApiType, Marketplace  # type: ignore[import]
         except ImportError as exc:
             raise ImportError(
                 "junglescout-client is not installed. "
                 "Run: pip install 'junglescout-client>=0.6,<1'"
             ) from exc
 
-        self._client = _JSClient(
+        self._client = ClientSync(
             api_key_name=api_key_name,
             api_key=api_key,
-            marketplace="US",  # default; overridden per-call via marketplace param
+            api_type=ApiType.JS,
         )
-        self._ApiType = ApiType
+        self._Marketplace = Marketplace
         logger.debug("JungleScoutClient initialised (key_name=%s)", api_key_name)
 
     # ------------------------------------------------------------------
