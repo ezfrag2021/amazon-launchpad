@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "oh-my-opencode"
+  ],
+  "permission": {
+    "bash": "allow",
+    "edit": "allow",
+    "read": "allow",
+    "list": "allow",
+    "glob": "allow"
+  },
+  "provider": {
+    "opencode": {
+      "models": {
+        "kimi-k2.5-free": {}
+      }
+    },
+    "anthropic": {
+      "models": {
+        "claude-sonnet-4-5": {}
+      }
+    },
+    "github-copilot": {
+      "models": {
+        "gemini-3-flash-preview": {}
+      }
+    },
+    "openai": {
+      "models": {
+        "gpt-5.2-codex": {}
+      }
+    }
+  },
+  "mcp": {
+    "megamemory": {
+      "type": "local",
+      "command": [
+        "megamemory"
+      ],
+      "enabled": true
+    }
+  }
+}

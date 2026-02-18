@@ -1,0 +1,68 @@
+"""
+Google Generative AI authentication manager.
+
+Provides service account key resolution and google.generativeai client
+configuration for Gemini model usage in the Creative Studio (Stage 4).
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+from google.oauth2 import service_account
+import google.generativeai as genai
+
+# Default key filename shared with amazon-mi
+_DEFAULT_KEY_FILENAME = "gen-lang-client-0422857398-6a11b7435ae6.json"
+
+# Required OAuth scope for Generative Language API
+_GENERATIVE_LANGUAGE_SCOPE = "https://www.googleapis.com/auth/generative-language"
+
+
+def resolve_service_account_key_path() -> Path:
+    """Return the path to the Google service account JSON key file.
+
+    Resolution order:
+    1. ``GOOGLE_SERVICE_ACCOUNT_JSON`` environment variable (absolute or relative path)
+    2. Default filename ``gen-lang-client-0422857398-6a11b7435ae6.json`` located
+       next to this file's parent directory (repo root).
+    """
+    env_value = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_value and env_value != "<GOOGLE_SERVICE_ACCOUNT_JSON_PATH>":
+        return Path(env_value)
+
+    # Fallback: repo root (two levels up from services/)
+    repo_root = Path(__file__).parent.parent
+    return repo_root / _DEFAULT_KEY_FILENAME
+
+
+def get_generative_client() -> Any:
+    """Configure google.generativeai with service account credentials and return the module.
+
+    Credentials are loaded lazily (not at import time) using the service account
+    key resolved by :func:`resolve_service_account_key_path`.
+
+    Returns:
+        The configured ``google.generativeai`` module, ready for model calls.
+
+    Raises:
+        FileNotFoundError: If the service account key file does not exist.
+        google.auth.exceptions.TransportError: On credential refresh failures.
+    """
+    key_path = resolve_service_account_key_path()
+
+    if not key_path.exists():
+        raise FileNotFoundError(
+            f"Google service account key not found at '{key_path}'. "
+            "Set the GOOGLE_SERVICE_ACCOUNT_JSON environment variable to the correct path."
+        )
+
+    credentials = service_account.Credentials.from_service_account_file(
+        str(key_path),
+        scopes=[_GENERATIVE_LANGUAGE_SCOPE],
+    )
+
+    genai.configure(credentials=credentials)
+    return genai

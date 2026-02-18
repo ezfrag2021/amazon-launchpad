@@ -1,0 +1,23 @@
+# Core application
+streamlit>=1.28,<2.0
+psycopg[binary]>=3.1,<4.0
+python-dotenv>=1.0,<2.0
+
+# Jungle Scout API
+junglescout-client>=0.6,<1.0
+
+# Google Generative AI
+google-generativeai>=0.3,<1.0
+google-auth>=2.22,<3.0
+
+# Data handling
+pandas>=2.0,<3.0
+numpy>=1.24,<2.0
+
+# Optional but recommended
+pydantic>=2.0,<3.0
+
+# Development (optional, uncomment if needed)
+# pytest>=7.4,<8.0
+# black>=23.0,<24.0
+# mypy>=1.5,<2.0
