@@ -14,8 +14,9 @@ from typing import Any
 
 import psycopg
 import streamlit as st
+from dotenv import load_dotenv
 
-from services.db_connection import connect, normalize_dsn, resolve_dsn
+from services.db_connection import connect, resolve_dsn
 from services.js_client import BudgetExhaustedError, JungleScoutClient
 from services.launch_state import LaunchStateManager
 from services.opportunity_scorer import (
@@ -53,15 +54,16 @@ SCORE_EMOJIS = {
     CATEGORY_GOLDMINE: "🟢",
 }
 
+# Load environment variables
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def _get_dsn() -> str:
-    """Resolve and normalise the database DSN once per session."""
-    raw = resolve_dsn("LAUNCHPAD_DB_DSN", "MARKET_INTEL_DSN", "PG_DSN")
-    return normalize_dsn(raw)
+    """Resolve the database DSN once per session."""
+    return resolve_dsn("LAUNCHPAD_DB_DSN", "MARKET_INTEL_DSN", "PG_DSN")
 
 
 def _open_conn() -> psycopg.Connection:

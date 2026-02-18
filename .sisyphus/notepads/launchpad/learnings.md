@@ -1,0 +1,1 @@
+- 2026-02-18: Launchpad DB DSN in .env already uses URL-encoded password values; calling normalize_dsn() re-encodes `%` to `%25` and breaks auth for launchpad_app.

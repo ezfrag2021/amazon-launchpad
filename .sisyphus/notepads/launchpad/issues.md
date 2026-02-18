@@ -1,0 +1,2 @@
+- 2026-02-18: Streamlit dashboard on :8503 shows DB errors because app.py always normalizes pre-encoded DSN, causing `password authentication failed for user "launchpad_app"`.
+- 2026-02-18: launchpad schema exists but has zero relations (`launchpad.product_launches` missing), so migrations 002-006 have not been applied in amazon_dash.

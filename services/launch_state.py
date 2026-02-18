@@ -364,7 +364,7 @@ class LaunchStateManager:
                     """
                     SELECT COUNT(*) AS total,
                            COUNT(*) FILTER (WHERE status IN ('pending', 'blocked')) AS blocking
-                    FROM launchpad.compliance_checklist
+                    FROM launchpad.launch_compliance_checklist
                     WHERE launch_id = %s
                     """,
                     (launch_id,),
@@ -484,7 +484,7 @@ class LaunchStateManager:
             cur.execute(
                 """
                 SELECT status, COUNT(*) AS cnt
-                FROM launchpad.compliance_checklist
+                FROM launchpad.launch_compliance_checklist
                 WHERE launch_id = %s
                 GROUP BY status
                 """,

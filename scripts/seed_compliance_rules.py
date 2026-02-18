@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import psycopg
 from dotenv import load_dotenv
 
-from services.db_connection import connect, normalize_dsn, resolve_dsn
+from services.db_connection import connect, resolve_dsn
 
 
 # ---------------------------------------------------------------------------
@@ -724,8 +724,6 @@ Examples:
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-
-    dsn = normalize_dsn(dsn)
 
     print("Connecting to database...")
     try:

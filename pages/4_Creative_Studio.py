@@ -18,10 +18,11 @@ from typing import Any
 
 import psycopg
 import streamlit as st
+from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
 from services.auth_manager import get_generative_client
-from services.db_connection import connect, normalize_dsn, resolve_dsn
+from services.db_connection import connect, resolve_dsn
 from services.launch_state import LaunchStateManager
 
 logger = logging.getLogger(__name__)
@@ -62,14 +63,15 @@ AMAZON_LIMITS = {
 GEMINI_MODEL = "gemini-2.0-flash"
 IMAGEN_MODEL = "imagen-3.0-generate-001"
 
+# Load environment variables
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def _get_dsn() -> str:
-    raw = resolve_dsn("LAUNCHPAD_DB_DSN", "MARKET_INTEL_DSN", "PG_DSN")
-    return normalize_dsn(raw)
+    return resolve_dsn("LAUNCHPAD_DB_DSN", "MARKET_INTEL_DSN", "PG_DSN")
 
 
 def _open_conn() -> psycopg.Connection:

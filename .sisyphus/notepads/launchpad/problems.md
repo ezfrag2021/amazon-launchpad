@@ -1,0 +1,1 @@
+- 2026-02-18: Unresolved until user action: production-safe migration execution requires postgres/superuser credentials not available in current shell context.

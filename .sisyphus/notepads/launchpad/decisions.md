@@ -1,0 +1,1 @@
+- 2026-02-18: Fix order should be (1) correct DSN handling in code, (2) apply launchpad migrations, (3) seed compliance rules, then verify dashboard/stage pages.

@@ -15,7 +15,7 @@ import psycopg
 import streamlit as st
 from dotenv import load_dotenv
 
-from services.db_connection import connect, normalize_dsn, resolve_dsn
+from services.db_connection import connect, resolve_dsn
 from services.js_client import JungleScoutClient
 from services.launch_state import STAGE_COMPLIANCE, STAGE_PRICING, LaunchStateManager
 from services.pricing_engine import PricingEngine
@@ -41,8 +41,7 @@ def get_connection() -> psycopg.Connection | None:
     """Return a cached psycopg connection, or None on failure."""
     try:
         raw_dsn = resolve_dsn("LAUNCHPAD_DB_DSN", "MARKET_INTEL_DSN", "PG_DSN")
-        dsn = normalize_dsn(raw_dsn)
-        return connect(dsn)
+        return connect(raw_dsn)
     except Exception as exc:  # noqa: BLE001
         st.error(f"⚠️ Database connection failed: {exc}")
         return None
