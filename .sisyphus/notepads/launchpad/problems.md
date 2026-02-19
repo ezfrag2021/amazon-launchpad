@@ -1,1 +1,2 @@
 - 2026-02-18: Unresolved until user action: production-safe migration execution requires postgres/superuser credentials not available in current shell context.
+- 2026-02-19: Unresolved blocker: applying migration 008 requires a login role that can `SET ROLE launchpad_admin` (or ownership-level privileges on launchpad.jungle_scout_cache).

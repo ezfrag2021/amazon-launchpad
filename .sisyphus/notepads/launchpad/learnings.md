@@ -1,1 +1,4 @@
 - 2026-02-18: Launchpad DB DSN in .env already uses URL-encoded password values; calling normalize_dsn() re-encodes `%` to `%25` and breaks auth for launchpad_app.
+- 2026-02-19: Cache-first JS client flow should be `get_js_cache -> reserve_budget -> API fetch -> set_js_cache`; this prevents budget consumption on cache hits and preserves existing budget behavior on misses.
+- 2026-02-19: Deterministic cache keys should hash sorted JSON params (`json.dumps(..., sort_keys=True, separators=(",", ":"))`) so semantically identical requests reuse cache entries.
+- 2026-02-19: LAUNCHPAD_DB_DSN resolves to launchpad_app without membership in launchpad_admin; migrations containing `SET ROLE launchpad_admin` cannot run from this DSN.
