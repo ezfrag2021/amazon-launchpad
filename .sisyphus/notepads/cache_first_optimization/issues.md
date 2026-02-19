@@ -1,0 +1,2 @@
+- Initial test run failed because `.venv` did not include `pytest`; resolved by installing `pytest` into `.venv`.
+- Direct `from services.js_client import JungleScoutClient` triggered `services/__init__.py` imports requiring `google` package; resolved by importing `services/js_client.py` directly from file path in tests.

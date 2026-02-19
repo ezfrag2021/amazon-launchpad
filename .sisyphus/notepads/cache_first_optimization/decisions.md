@@ -1,0 +1,2 @@
+- Chose pure unit tests with mocked DB cursor/connection and mocked fetch functions to keep tests independent from Postgres migrations and external Jungle Scout API behavior.
+- Used `JungleScoutClient.__new__` in fixtures to bypass env-var and package initialization in `__init__`, so tests focus strictly on cache-first logic paths.
