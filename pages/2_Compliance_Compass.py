@@ -7,6 +7,7 @@ generates a per-launch compliance checklist, and tracks completion status.
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date, datetime
 from typing import Any
@@ -17,8 +18,10 @@ from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
 from services.compliance_engine import ComplianceEngine
+from services.compliance_profile import ProductProfile
 from services.db_connection import connect, resolve_dsn
 from services.launch_state import STAGE_COMPLIANCE, LaunchStateManager
+from services.product_profiler import infer_product_profile
 
 # ---------------------------------------------------------------------------
 # Page configuration — must be the first Streamlit call
@@ -84,6 +87,95 @@ _STATUS_CONFIG: dict[str, dict[str, str]] = {
 
 _STATUS_OPTIONS = ["pending", "in_progress", "completed", "not_applicable", "blocked"]
 
+_CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "Electronic Toys": [
+        "electronic toy", "robot toy", "rc car", "remote control toy",
+        "drone toy", "tech toy", "toy car", "toy robot", "interactive toy",
+    ],
+    "Electronics": [
+        "electronic", "electrical", "gadget", "usb", "bluetooth", "wireless",
+        "smart home", "led light", "charger", "adapter", "power bank",
+        "speaker", "headphone", "earphone", "camera", "monitor",
+    ],
+    "Toys & Games": [
+        "toy", "game", "puzzle", "doll", "action figure", "plush",
+        "building block", "board game", "play set", "stuffed animal",
+    ],
+    "Kitchen Appliances": [
+        "kitchen appliance", "blender", "mixer", "toaster", "kettle",
+        "coffee maker", "air fryer", "food processor", "microwave",
+    ],
+    "Home & Kitchen": [
+        "home", "cookware", "utensil", "storage container", "organizer",
+    ],
+    "Clothing & Apparel": [
+        "clothing", "apparel", "shirt", "dress", "jacket", "pants",
+        "trousers", "shoes", "boots", "fashion", "garment",
+    ],
+    "Textiles": [
+        "textile", "fabric", "linen", "curtain", "towel", "bedding",
+    ],
+    "Furniture": [
+        "furniture", "chair", "table", "desk", "shelf", "cabinet", "sofa",
+    ],
+    "Beauty & Personal Care": [
+        "beauty", "skincare", "cosmetic", "makeup", "shampoo", "lotion",
+    ],
+    "Baby Products": [
+        "baby", "infant", "newborn", "nursery", "stroller", "car seat",
+    ],
+    "Sports & Outdoors": [
+        "sport", "outdoor", "fitness", "exercise", "camping", "hiking",
+    ],
+    "Lighting": [
+        "lamp", "light", "bulb", "lighting", "chandelier", "led strip",
+    ],
+    "Batteries & Chargers": [
+        "battery", "batteries", "charger", "charging", "power supply",
+    ],
+}
+
+_REGIME_PACKAGING_INFO: dict[str, list[str]] = {
+    "CE": [
+        "CE mark affixed visibly, legibly, and indelibly on product/packaging",
+        "EU Declaration of Conformity (DoC) included or accessible via URL/QR",
+        "Manufacturer name, registered trade name/trademark, and postal address",
+        "EU Authorised Representative details (for non-EU manufacturers)",
+        "Product identification (type, batch, serial number)",
+    ],
+    "UKCA": [
+        "UKCA mark displayed on product or packaging",
+        "UK Declaration of Conformity document",
+        "UK Responsible Person name and GB postal address",
+        "Importer details if manufacturer is outside UK",
+    ],
+    "WEEE": [
+        "Crossed-out wheelie bin symbol on product and packaging",
+        "Producer registration number on packaging",
+        "Separate collection instructions for end-of-life disposal",
+    ],
+    "RoHS": [
+        "RoHS compliance declaration or CE marking (covers RoHS for EEE)",
+        "Material composition documentation available on request",
+        "No restricted substances above threshold limits in packaging materials",
+    ],
+    "ToyEN71": [
+        "CE mark on toy and packaging (mandatory for EU toy safety)",
+        "Age warning labels (e.g. 'Not suitable for children under 3 years')",
+        "Choking hazard warnings where applicable",
+        "Manufacturer/importer identification on packaging",
+        "EN 71 test report reference",
+    ],
+    "DPP": [
+        "Digital Product Passport data carrier (QR code) on product/packaging",
+        "Unique product identifier linked to DPP registry",
+        "Sustainability and circularity information accessible via DPP",
+        "Material composition and recyclability data",
+        "Carbon footprint declaration (where applicable)",
+    ],
+}
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -250,6 +342,68 @@ def status_badge(status: str) -> str:
     )
 
 
+def _suggest_category(description: str) -> str | None:
+    if not description:
+        return None
+    desc_lower = description.lower()
+    best_match: str | None = None
+    best_score = 0
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in desc_lower)
+        if score > best_score:
+            best_score = score
+            best_match = category
+    return best_match if best_score > 0 else None
+
+
+def _render_risk_assessment_display(assessment: dict[str, Any]) -> None:
+    level = assessment.get("overall_risk_level", "unknown")
+    level_colors = {
+        "low": "#21C354", "medium": "#FF9900",
+        "high": "#FF4B4B", "critical": "#CC0000",
+    }
+    level_icons = {"low": "🟢", "medium": "🟡", "high": "🟠", "critical": "🔴"}
+    color = level_colors.get(level, "#888888")
+
+    st.markdown(
+        f"**Overall Risk Level:** "
+        f"<span style='background:{color};color:white;padding:2px 12px;"
+        f"border-radius:4px;font-weight:bold;text-transform:uppercase'>"
+        f"{level_icons.get(level, '⚪')} {level}</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(assessment.get("summary", ""))
+
+    for risk in assessment.get("risks", []):
+        severity = risk.get("severity", "unknown")
+        sev_icon = level_icons.get(severity, "⚪")
+        expanded = severity in ("high", "critical")
+
+        with st.expander(
+            f"{sev_icon} {risk.get('risk_name', 'Unknown Risk')} — {severity.upper()}",
+            expanded=expanded,
+        ):
+            st.markdown(risk.get("description", ""))
+            refs = risk.get("regime_references", [])
+            if refs:
+                ref_badges = " ".join(
+                    regime_badge(r) for r in refs if r in _REGIME_CONFIG
+                )
+                if ref_badges:
+                    st.markdown(f"**Regimes:** {ref_badges}", unsafe_allow_html=True)
+            mitigations = risk.get("mitigations", [])
+            if mitigations:
+                st.markdown("**Mitigations:**")
+                for m in mitigations:
+                    st.markdown(f"- {m}")
+
+    actions = assessment.get("recommended_priority_actions", [])
+    if actions:
+        st.markdown("**Priority Actions:**")
+        for i, action in enumerate(actions, 1):
+            st.markdown(f"{i}. {action}")
+
+
 # ---------------------------------------------------------------------------
 # Main page
 # ---------------------------------------------------------------------------
@@ -305,12 +459,16 @@ default_idx = 0
 if default_launch_id in launch_ids:
     default_idx = launch_ids.index(default_launch_id)
 
-selected_launch_id = st.selectbox(
+selected_launch_raw = st.selectbox(
     "Active Launch",
     options=launch_ids,
     index=default_idx,
     format_func=lambda lid: launch_options[lid],
 )
+if selected_launch_raw is None:
+    st.error("No launch selected.")
+    st.stop()
+selected_launch_id = int(selected_launch_raw)
 st.session_state["selected_launch_id"] = selected_launch_id
 
 # Load selected launch details
@@ -334,6 +492,17 @@ if selected_launch.get("pursuit_score") is None:
     )
     st.stop()
 
+if int(selected_launch.get("current_stage") or 1) < STAGE_COMPLIANCE:
+    try:
+        lsm_sync = LaunchStateManager()
+        lsm_sync.update_launch(conn, selected_launch_id, current_stage=STAGE_COMPLIANCE)
+        conn.commit()
+        selected_launch["current_stage"] = STAGE_COMPLIANCE
+        st.info("Auto-updated launch stage to Stage 2 after Stage 1 completion.")
+    except Exception as exc:
+        conn.rollback()
+        st.warning(f"Could not auto-update launch stage to Stage 2: {exc}")
+
 # Show launch summary
 info_col1, info_col2, info_col3 = st.columns(3)
 info_col1.metric("Launch ID", f"#{selected_launch_id}")
@@ -350,135 +519,526 @@ with desc_col2:
 
 st.markdown("---")
 
-# ---------------------------------------------------------------------------
-# Product category analysis
-# ---------------------------------------------------------------------------
-st.subheader("📦 Product Category")
-
-current_category = selected_launch.get("product_category") or ""
-
-with st.expander("Edit Product Category", expanded=not bool(current_category)):
-    new_category = st.text_input(
-        "Product Category",
-        value=current_category,
-        placeholder="e.g. Electronic Toys, Kitchen Appliances, Clothing…",
-        help="Used to match applicable compliance regimes. Be specific.",
-        key="category_input",
-    )
-    if st.button("💾 Save Category", key="save_category"):
-        if new_category.strip():
-            try:
-                update_product_category(conn, selected_launch_id, new_category.strip())
-                st.success(f"✅ Category updated to: **{new_category.strip()}**")
-                current_category = new_category.strip()
-                st.rerun()
-            except Exception as exc:
-                conn.rollback()
-                st.error(f"Failed to update category: {exc}")
-        else:
-            st.warning("Category cannot be empty.")
-
-if current_category:
-    st.markdown(f"**Current category:** `{current_category}`")
-else:
-    st.warning("⚠️ No product category set. Please set a category to analyse compliance requirements.")
-    st.stop()
-
-# ---------------------------------------------------------------------------
-# Compliance rules matching & checklist generation
-# ---------------------------------------------------------------------------
-st.markdown("---")
-st.subheader("🔍 Compliance Requirements Analysis")
-
+lid = selected_launch_id
 engine = ComplianceEngine()
 
-# Check DPP relevance
-dpp_relevant = engine.is_dpp_relevant(current_category, {})
-if dpp_relevant:
-    st.warning(
-        "📱 **DPP 2026 Alert:** This product category may fall under the EU Digital Product Passport "
-        "regulation, mandatory from 2026. DPP requirements are included in the checklist below."
-    )
-
-# Load existing checklist
 try:
-    existing_checklist = load_checklist_for_launch(conn, selected_launch_id)
+    all_rules = load_compliance_rules(conn)
     conn.commit()
 except Exception as exc:
     conn.rollback()
-    st.error(f"Failed to load checklist: {exc}")
+    all_rules = []
+
+try:
+    existing_checklist = load_checklist_for_launch(conn, lid)
+    conn.commit()
+except Exception as exc:
+    conn.rollback()
     existing_checklist = []
 
-# Analyse button
-col_analyze, col_info = st.columns([2, 4])
-with col_analyze:
-    analyze_clicked = st.button(
-        "🔎 Analyse Compliance Requirements",
-        type="primary",
-        use_container_width=True,
-        key="analyze_btn",
+# ═══════════════════════════════════════════════════════════════════════════
+# STEP 1: PRODUCT CATEGORY — auto-suggest, edit, lock/reset
+# ═══════════════════════════════════════════════════════════════════════════
+st.subheader("📦 Step 1: Product Category")
+
+db_category = selected_launch.get("product_category") or ""
+lock_key = f"cc_cat_locked_{lid}"
+val_key = f"cc_cat_value_{lid}"
+unlock_key = f"cc_force_unlock_{lid}"
+
+if lock_key not in st.session_state:
+    st.session_state[lock_key] = bool(db_category) and not st.session_state.get(unlock_key, False)
+if val_key not in st.session_state:
+    suggestion = _suggest_category(selected_launch.get("product_description", ""))
+    st.session_state[val_key] = db_category or suggestion or ""
+
+category_locked = st.session_state[lock_key]
+
+if not category_locked:
+    working_value = st.session_state.get(val_key, "")
+    suggestion = _suggest_category(selected_launch.get("product_description", ""))
+
+    if suggestion and not working_value:
+        st.info(f"**Suggested category:** {suggestion} (based on product description)")
+        st.session_state[val_key] = suggestion
+        working_value = suggestion
+
+    edited_category = st.text_input(
+        "Product Category",
+        value=working_value,
+        placeholder="e.g. Electronic Toys, Kitchen Appliances, Clothing…",
+        help="Used to match applicable compliance regimes. Be specific.",
+        key=f"cc_cat_input_{lid}",
     )
+    st.session_state[val_key] = edited_category
 
-with col_info:
-    if existing_checklist:
-        st.info(
-            f"ℹ️ Checklist already has **{len(existing_checklist)} item(s)**. "
-            "Re-analysing will add any new matching rules (existing items are preserved)."
-        )
-    else:
-        st.info("Click **Analyse** to match compliance rules for this product category.")
-
-if analyze_clicked:
-    try:
-        rules = load_compliance_rules(conn)
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        st.error(f"Failed to load compliance rules: {exc}")
-        rules = []
-
-    if not rules:
-        st.warning(
-            "⚠️ No compliance rules found in the database. "
-            "Please run the seed script: `python scripts/seed_compliance_rules.py`"
-        )
-    else:
-        matched = engine.match_rules_for_product(current_category, {}, rules)
-
-        if not matched:
-            st.warning(
-                f"No compliance rules matched for category **'{current_category}'**. "
-                "Try a more specific category (e.g. 'Electronic Toys', 'Kitchen Appliances')."
-            )
-        else:
-            # Generate checklist items
-            checklist_items = engine.generate_checklist(
-                selected_launch_id, current_category, {}, rules
-            )
-
+    if st.button("🔒 Lock Category & Proceed", type="primary"):
+        if edited_category.strip():
             try:
-                upsert_checklist_items(conn, selected_launch_id, checklist_items)
-                # Reload
-                existing_checklist = load_checklist_for_launch(conn, selected_launch_id)
-                conn.commit()
-
-                # Count by regime
-                regime_counts: dict[str, int] = {}
-                for item in checklist_items:
-                    r = item.get("regime", "Unknown")
-                    regime_counts[r] = regime_counts.get(r, 0) + 1
-
-                st.success(
-                    f"✅ Found **{len(matched)} applicable rule(s)** across "
-                    f"**{len(regime_counts)} regime(s)**. Checklist updated."
-                )
-                for regime, count in sorted(regime_counts.items()):
-                    cfg = _REGIME_CONFIG.get(regime, {"icon": "📋", "label": regime})
-                    st.markdown(f"- {cfg['icon']} **{cfg['label']}**: {count} requirement(s)")
-
+                update_product_category(conn, lid, edited_category.strip())
+                st.session_state[lock_key] = True
+                st.session_state[val_key] = edited_category.strip()
+                st.session_state.pop(unlock_key, None)
+                st.rerun()
             except Exception as exc:
                 conn.rollback()
-                st.error(f"Failed to save checklist: {exc}")
+                st.error(f"Failed to save category: {exc}")
+        else:
+            st.warning("Category cannot be empty.")
+else:
+    active_category = st.session_state.get(val_key, db_category)
+    col_cat, col_reset = st.columns([5, 1])
+    with col_cat:
+        st.success(f"🔒 **Category locked:** `{active_category}`")
+    with col_reset:
+        if st.button("🔄 Reset", key="cc_reset_flow"):
+            st.session_state[unlock_key] = True
+            keys_to_clear = [
+                lock_key, val_key,
+                f"cc_profile_{lid}", f"cc_profile_confirmed_{lid}",
+                f"cc_regimes_confirmed_{lid}", f"cc_selected_regimes_{lid}",
+                f"cc_risk_assessment_{lid}", f"cc_intended_use_{lid}",
+                f"cc_materials_{lid}", f"cc_regime_select_{lid}",
+            ]
+            for key in keys_to_clear:
+                st.session_state.pop(key, None)
+            st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STEP 1.5: CONFIRM PRODUCT PROFILE (gated on category lock)
+# ═══════════════════════════════════════════════════════════════════════════
+profile_confirmed = False
+active_profile: ProductProfile | None = None
+
+if category_locked:
+    active_category = st.session_state.get(val_key, db_category)
+    profile_key = f"cc_profile_{lid}"
+    profile_confirmed_key = f"cc_profile_confirmed_{lid}"
+
+    if profile_key not in st.session_state:
+        with st.spinner("Analyzing product profile..."):
+            inferred = infer_product_profile(
+                active_category,
+                selected_launch.get("product_description", "")
+            )
+            st.session_state[profile_key] = inferred.as_dict()
+    
+    p_data = st.session_state[profile_key]
+    profile_confirmed = st.session_state.get(profile_confirmed_key, False)
+
+    if not profile_confirmed:
+        st.markdown("---")
+        st.subheader("🧬 Step 1.5: Confirm Product Profile")
+        st.info("Verify these characteristics to ensure accurate compliance rules.")
+
+        col_p1, col_p2 = st.columns([2, 1])
+        with col_p1:
+            st.markdown("#### Core Characteristics")
+            
+            def _render_flag(label: str, key_suffix: str, help_text: str):
+                current_val = p_data.get(key_suffix, False)
+                new_val = st.toggle(label, value=current_val, help=help_text, key=f"toggle_{key_suffix}_{lid}")
+                if new_val != current_val:
+                    p_data[key_suffix] = new_val
+                    st.session_state[profile_key] = p_data
+
+            _render_flag("⚡ Is Electrical (Mains/Low Voltage)", "is_electrical", "Triggers LVD, EMC")
+            _render_flag("🔌 Is Electronic (PCBs/Components)", "is_electronic", "Triggers RoHS, WEEE")
+            _render_flag("🔋 Contains Batteries", "contains_batteries", "Triggers Battery Regulation")
+            _render_flag("📡 Radio/Wireless (WiFi/BT/RF)", "is_radio_equipment", "Triggers RED")
+            
+            st.markdown("#### Target Audience & Safety")
+            _render_flag("🧸 Is Toy (< 14 years)", "is_toy", "Triggers Toy Safety Directive")
+            _render_flag("👶 Is Childcare (< 36 months)", "is_childcare", "Strict chemical/mechanical safety")
+            _render_flag("🛡️ Is PPE (Protective Equip)", "is_ppe", "Triggers PPE Regulation")
+            _render_flag("⚕️ Is Medical Device", "is_medical", "Triggers MDR")
+
+        with col_p2:
+            st.markdown("#### Material & Category")
+            _render_flag("🍽️ Food Contact", "is_food_contact", "Triggers FCM")
+            _render_flag("💄 Cosmetic", "is_cosmetic", "Triggers Cosmetics Reg")
+            _render_flag("🧪 Chemical / Mixture", "is_chemical", "Triggers CLP/REACH")
+            _render_flag("👗 Textile / Footwear", "is_textile", "Triggers Textile Labeling")
+            _render_flag("🪑 Furniture", "is_furniture", "Triggers Flammability/DPP")
+            _render_flag("💡 Lighting", "is_lighting", "Triggers EcoDesign")
+            
+            st.metric("AI Confidence", f"{p_data.get('confidence', 0.0):.0%}")
+            
+            if st.button("✅ Confirm Profile & Continue", type="primary", use_container_width=True):
+                st.session_state[profile_confirmed_key] = True
+                st.rerun()
+
+    else:
+        active_profile = ProductProfile.from_dict(p_data)
+        flags = active_profile.active_flags
+        
+        col_prof, col_prof_edit = st.columns([5, 1])
+        with col_prof:
+            if flags:
+                flag_badges = " ".join(
+                    f"<span style='background:#E0E0E0;color:#333;padding:2px 8px;border-radius:12px;font-size:0.8em'>{f}</span>"
+                    for f in flags
+                )
+                st.markdown(f"🧬 **Profile Confirmed:** {flag_badges}", unsafe_allow_html=True)
+            else:
+                st.markdown("🧬 **Profile Confirmed:** (No specific triggers set)")
+                
+        with col_prof_edit:
+             if st.button("✏️ Edit Profile", key="cc_edit_profile"):
+                st.session_state[profile_confirmed_key] = False
+                # Force re-selection of regimes when profile changes
+                st.session_state[f"cc_regimes_confirmed_{lid}"] = False
+                st.session_state.pop(f"cc_selected_regimes_{lid}", None)
+                st.rerun()
+
+if category_locked and profile_confirmed and active_profile:
+    active_category = st.session_state.get(val_key, db_category)
+    st.markdown("---")
+    st.subheader("⚖️ Step 2: Select Applicable Regimes")
+
+    matched_rules = engine.match_rules_for_product(active_profile, {}, all_rules)
+    inferred_regimes = sorted(
+        {str(r["regime"]) for r in matched_rules if r.get("regime")}
+    )
+
+    confirmed_key = f"cc_regimes_confirmed_{lid}"
+    regimes_key = f"cc_selected_regimes_{lid}"
+
+    if confirmed_key not in st.session_state:
+        if existing_checklist:
+            checklist_regimes = sorted(
+                {str(item["regime"]) for item in existing_checklist if item.get("regime")}
+            )
+            st.session_state[regimes_key] = checklist_regimes
+            st.session_state[confirmed_key] = True
+        else:
+            st.session_state[confirmed_key] = False
+
+    regimes_confirmed = st.session_state[confirmed_key]
+
+    if not regimes_confirmed:
+        if inferred_regimes:
+            st.markdown(
+                "Based on **\"" + active_category + "\"**, auto-detected regimes: "
+                + ", ".join(f"**{r}**" for r in inferred_regimes)
+            )
+        else:
+            st.info("No regimes auto-detected for this category. Select manually below.")
+
+        prev_selected = st.session_state.get(regimes_key, inferred_regimes)
+
+        selected_regimes = st.multiselect(
+            "Applicable Regimes",
+            options=ComplianceEngine.ALL_REGIMES,
+            default=[r for r in prev_selected if r in ComplianceEngine.ALL_REGIMES],
+            format_func=lambda r: (
+                f"{_REGIME_CONFIG.get(r, {}).get('icon', '📋')} "
+                f"{_REGIME_CONFIG.get(r, {}).get('label', r)}"
+            ),
+            key=f"cc_regime_select_{lid}",
+        )
+
+        for regime in ComplianceEngine.ALL_REGIMES:
+            cfg = _REGIME_CONFIG.get(regime, {})
+            tag = " *(auto-detected)*" if regime in inferred_regimes else ""
+            st.caption(
+                f"{cfg.get('icon', '📋')} **{cfg.get('label', regime)}**{tag}"
+                f" — {cfg.get('description', '')}"
+            )
+
+        if st.button("✅ Confirm Regime Selection", type="primary"):
+            if selected_regimes:
+                st.session_state[regimes_key] = selected_regimes
+                st.session_state[confirmed_key] = True
+                st.rerun()
+            else:
+                st.warning("Select at least one regime to proceed.")
+    else:
+        selected_regimes = st.session_state.get(regimes_key, inferred_regimes)
+        badges = " ".join(regime_badge(r) for r in selected_regimes)
+        col_regimes, col_edit = st.columns([5, 1])
+        with col_regimes:
+            st.markdown(f"**Confirmed regimes:** {badges}", unsafe_allow_html=True)
+        with col_edit:
+            if st.button("✏️ Edit", key="cc_edit_regimes"):
+                st.session_state[confirmed_key] = False
+                st.session_state.pop(f"cc_regime_select_{lid}", None)
+                st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STEPS 3–4 + CHECKLIST GENERATION (gated on regime confirmation)
+# ═══════════════════════════════════════════════════════════════════════════
+regimes_confirmed = st.session_state.get(f"cc_regimes_confirmed_{lid}", False)
+selected_regimes = st.session_state.get(f"cc_selected_regimes_{lid}", [])
+
+# Ensure we have the profile loaded for these steps
+if category_locked and not active_profile:
+    _p_data = st.session_state.get(f"cc_profile_{lid}")
+    if _p_data:
+        active_profile = ProductProfile.from_dict(_p_data)
+
+if category_locked and profile_confirmed and regimes_confirmed and selected_regimes:
+    active_category = st.session_state.get(val_key, db_category)
+    
+    # Use profile if available, else category string
+    product_scope = active_profile if active_profile else active_category
+    
+    matched_rules = engine.match_rules_for_product(product_scope, {}, all_rules)
+    regime_filtered_rules = [
+        r for r in matched_rules if r.get("regime") in selected_regimes
+    ]
+
+    # --- Step 3: Requirements & Packaging ---
+    st.markdown("---")
+    st.subheader("📋 Step 3: Requirements & Packaging")
+
+    tab_reqs, tab_pkg, tab_label = st.tabs(["📄 Key Requirements", "📦 Packaging Requirements", "🏷️ Labelling"])
+
+    with tab_reqs:
+        if regime_filtered_rules:
+            rules_by_regime: dict[str, list[dict[str, Any]]] = {}
+            for rule in regime_filtered_rules:
+                rules_by_regime.setdefault(rule.get("regime", "Unknown"), []).append(rule)
+
+            for regime in selected_regimes:
+                rules_for_regime = rules_by_regime.get(regime, [])
+                cfg = _REGIME_CONFIG.get(regime, {"icon": "📋", "label": regime})
+                with st.expander(
+                    f"{cfg['icon']} {cfg['label']} — {len(rules_for_regime)} requirement(s)",
+                    expanded=bool(rules_for_regime),
+                ):
+                    if not rules_for_regime:
+                        st.caption("No specific rules matched for this regime.")
+                    for rule in rules_for_regime:
+                        st.markdown(f"**{rule.get('requirement_name', 'N/A')}**")
+                        if rule.get("requirement_description"):
+                            st.caption(rule["requirement_description"])
+                        docs = engine.get_required_documents(rule)
+                        filtered_docs = [
+                            d
+                            for d in docs
+                            if not (
+                                d.startswith("Article 19 Labelling:")
+                                or "Labelling:" in d
+                            )
+                        ]
+                        if filtered_docs:
+                            st.markdown(
+                                "Documents: "
+                                + ", ".join(f"📄 {d}" for d in filtered_docs)
+                            )
+                        if rule.get("source_url"):
+                            st.markdown(f"[🔗 Reference]({rule['source_url']})")
+                        st.markdown("")
+        else:
+            st.info("No specific rules matched. Checklist may still be generated from broader patterns.")
+
+    with tab_pkg:
+        for regime in selected_regimes:
+            cfg = _REGIME_CONFIG.get(regime, {"icon": "📋", "label": regime})
+            all_reqs = _REGIME_PACKAGING_INFO.get(regime, [])
+            
+            pkg_reqs = [
+                r for r in all_reqs 
+                if not (r.startswith("Article 19 Labelling:") or "Labelling:" in r)
+            ]
+            
+            with st.expander(f"{cfg['icon']} {cfg['label']} — Packaging", expanded=True):
+                if pkg_reqs:
+                    for req in pkg_reqs:
+                        st.markdown(f"- {req}")
+                else:
+                    st.caption("No specific packaging requirements defined.")
+
+    with tab_label:
+        has_any_labels = False
+
+        rule_labelling_by_regime = {}
+        if regime_filtered_rules:
+            for rule in regime_filtered_rules:
+                regime = rule.get("regime", "Unknown")
+                docs = engine.get_required_documents(rule)
+                if docs:
+                    for d in docs:
+                        if d.startswith("Article 19 Labelling:") or "Labelling:" in d:
+                            rule_labelling_by_regime.setdefault(regime, []).append(d)
+
+        for regime in selected_regimes:
+            cfg = _REGIME_CONFIG.get(regime, {"icon": "📋", "label": regime})
+            all_reqs = _REGIME_PACKAGING_INFO.get(regime, [])
+
+            label_reqs = [
+                r
+                for r in all_reqs
+                if (r.startswith("Article 19 Labelling:") or "Labelling:" in r)
+            ]
+
+            if regime in rule_labelling_by_regime:
+                label_reqs.extend(rule_labelling_by_regime[regime])
+
+            if label_reqs:
+                has_any_labels = True
+                with st.expander(
+                    f"{cfg['icon']} {cfg['label']} — Labelling", expanded=True
+                ):
+                    for req in sorted(set(label_reqs)):
+                        st.markdown(f"- {req}")
+
+        if not has_any_labels:
+            st.info(
+                "No specific labelling requirements identified for selected regimes."
+            )
+
+    dpp_relevant = engine.is_dpp_relevant(active_category, {})
+    if dpp_relevant and "DPP" in selected_regimes:
+        st.warning(
+            "📱 **DPP 2026 Alert:** This product may fall under the EU Digital "
+            "Product Passport regulation, mandatory from 2026."
+        )
+
+    # --- Step 4: AI Risk Assessment ---
+    st.markdown("---")
+    st.subheader("🤖 Step 4: AI Risk Assessment")
+
+    st.markdown("Provide additional context for a more accurate risk analysis.")
+
+    risk_key = f"cc_risk_assessment_{lid}"
+
+    col_use, col_mat = st.columns(2)
+    with col_use:
+        intended_use = st.text_area(
+            "Intended Use",
+            value=st.session_state.get(f"cc_intended_use_{lid}", ""),
+            placeholder="e.g. Children aged 6+, indoor use, educational purposes",
+            height=100,
+            key=f"cc_use_input_{lid}",
+        )
+        st.session_state[f"cc_intended_use_{lid}"] = intended_use
+    with col_mat:
+        materials = st.text_area(
+            "Key Materials & Components",
+            value=st.session_state.get(f"cc_materials_{lid}", ""),
+            placeholder="e.g. ABS plastic, lithium battery, LED lights, BPA-free silicone",
+            height=100,
+            key=f"cc_mat_input_{lid}",
+        )
+        st.session_state[f"cc_materials_{lid}"] = materials
+
+    cached_assessment = st.session_state.get(risk_key)
+    btn_label = "🔄 Regenerate" if cached_assessment else "🤖 Generate Risk Assessment"
+
+    if st.button(
+        btn_label,
+        type="secondary" if cached_assessment else "primary",
+        key="cc_gen_risk",
+    ):
+        with st.spinner("Analysing compliance risks with AI…"):
+            try:
+                from services.compliance_risk_assessment import assess_compliance_risks
+
+                key_reqs = [
+                    r.get("requirement_name", "")
+                    for r in regime_filtered_rules
+                    if r.get("requirement_name")
+                ]
+                result = assess_compliance_risks(
+                    product_category=active_category,
+                    intended_use=intended_use or "",
+                    materials=materials or "",
+                    selected_regimes=selected_regimes,
+                    key_requirements=key_reqs,
+                )
+                if result:
+                    st.session_state[risk_key] = result
+                    st.rerun()
+                else:
+                    st.error(
+                        "❌ Risk assessment failed. "
+                        "Check Gemini credentials or try again."
+                    )
+            except Exception as exc:
+                st.error(f"❌ Risk assessment error: {exc}")
+
+    if cached_assessment:
+        _render_risk_assessment_display(cached_assessment)
+    else:
+        st.caption(
+            "ℹ️ Risk assessment is optional. "
+            "Click above to generate, or proceed to checklist generation."
+        )
+
+    # --- Generate Checklist ---
+    st.markdown("---")
+    st.subheader("🔍 Generate Compliance Checklist")
+
+    col_analyze, col_info = st.columns([2, 4])
+    with col_analyze:
+        analyze_clicked = st.button(
+            "🔎 Generate Checklist for Selected Regimes",
+            type="primary",
+            use_container_width=True,
+            key="analyze_btn",
+        )
+    with col_info:
+        if existing_checklist:
+            st.info(
+                f"ℹ️ Checklist has **{len(existing_checklist)} item(s)**. "
+                "Re-generating adds new rules; existing items are preserved."
+            )
+        else:
+            st.info("Click **Generate** to create compliance checklist items.")
+
+    if analyze_clicked:
+        if not all_rules:
+            st.warning(
+                "⚠️ No compliance rules in database. "
+                "Run: `python scripts/seed_compliance_rules.py`"
+            )
+        else:
+            regime_scoped_rules = [
+                r for r in all_rules if r.get("regime") in selected_regimes
+            ]
+            # Use profile if available, else category string
+            product_scope = active_profile if active_profile else active_category
+
+            matched = engine.match_rules_for_product(
+                product_scope, {}, regime_scoped_rules
+            )
+
+            if not matched:
+                st.warning(
+                    f"No rules matched for **'{active_category}'** "
+                    "within selected regimes."
+                )
+            else:
+                checklist_items = engine.generate_checklist(
+                    lid, product_scope, {}, regime_scoped_rules
+                )
+                try:
+                    upsert_checklist_items(conn, lid, checklist_items)
+                    existing_checklist = load_checklist_for_launch(conn, lid)
+                    conn.commit()
+
+                    regime_counts: dict[str, int] = {}
+                    for item in checklist_items:
+                        r = item.get("regime", "Unknown")
+                        regime_counts[r] = regime_counts.get(r, 0) + 1
+
+                    st.success(
+                        f"✅ Found **{len(matched)} rule(s)** across "
+                        f"**{len(regime_counts)} regime(s)**. Checklist updated."
+                    )
+                    for regime, count in sorted(regime_counts.items()):
+                        cfg = _REGIME_CONFIG.get(
+                            regime, {"icon": "📋", "label": regime}
+                        )
+                        st.markdown(
+                            f"- {cfg['icon']} **{cfg['label']}**: "
+                            f"{count} requirement(s)"
+                        )
+                except Exception as exc:
+                    conn.rollback()
+                    st.error(f"Failed to save checklist: {exc}")
 
 # ---------------------------------------------------------------------------
 # Progress tracking
@@ -666,13 +1226,32 @@ if existing_checklist:
     st.markdown("---")
     st.subheader("📁 Documentation Tracker")
 
-    # Collect all required documents across all items
-    all_required_docs: dict[str, list[str]] = {}  # doc_name -> [requirement_names]
+    all_required_docs: dict[str, set[str]] = {}
     for item in existing_checklist:
         docs = item.get("documentation_required") or []
         req_name = item.get("requirement_name") or "Unknown"
         for doc in docs:
-            all_required_docs.setdefault(doc, []).append(req_name)
+            all_required_docs.setdefault(doc, set()).add(req_name)
+
+    if selected_regimes and all_rules:
+        val_key_local = locals().get("val_key")
+        category_value = (
+            st.session_state.get(val_key_local, db_category)
+            if val_key_local
+            else db_category
+        )
+        product_scope = active_profile if active_profile else category_value
+        if product_scope:
+            regime_scoped_rules = [
+                r for r in all_rules if r.get("regime") in selected_regimes
+            ]
+            matched_rules = engine.match_rules_for_product(
+                product_scope, {}, regime_scoped_rules
+            )
+            for rule in matched_rules:
+                req_name = rule.get("requirement_name") or "Unknown"
+                for doc in engine.get_required_documents(rule):
+                    all_required_docs.setdefault(doc, set()).add(req_name)
 
     # Collect uploaded evidence URLs
     uploaded_evidence = [
@@ -695,7 +1274,7 @@ if existing_checklist:
             )
             icon = "✅" if has_evidence else "📄"
             with st.expander(f"{icon} {doc_name}", expanded=False):
-                st.markdown(f"Required by: {', '.join(req_names)}")
+                st.markdown(f"Required by: {', '.join(sorted(req_names))}")
                 if has_evidence:
                     st.success("Evidence URL has been provided for at least one related requirement.")
                 else:
@@ -796,10 +1375,12 @@ if existing_checklist:
                     "these must be completed before advancing."
                 )
 
+elif not category_locked:
+    st.markdown("---")
+    st.info("🔒 Lock your product category in Step 1 to begin the compliance workflow.")
 else:
-    # No checklist yet
     st.markdown("---")
     st.info(
-        "📋 No compliance checklist generated yet. "
-        "Click **Analyse Compliance Requirements** above to get started."
+        "📋 No compliance checklist yet. "
+        "Complete the steps above and click **Generate Checklist**."
     )

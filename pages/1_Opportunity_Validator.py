@@ -327,6 +327,40 @@ def _fetch_competitors(
     return all_competitors
 
 
+def _build_mock_competitors(asin: str, target_marketplaces: list[str]) -> list[dict[str, Any]]:
+    """Return deterministic mock competitor rows without any API calls."""
+    templates = [
+        {"title": "Premium Stainless Bottle", "price": 24.99, "rating": 4.6, "review_count": 1840, "monthly_sales": 920},
+        {"title": "Insulated Sports Flask", "price": 19.99, "rating": 4.4, "review_count": 980, "monthly_sales": 760},
+        {"title": "Travel Thermo Tumbler", "price": 29.99, "rating": 4.7, "review_count": 2360, "monthly_sales": 1040},
+        {"title": "Leakproof Daily Bottle", "price": 17.49, "rating": 4.2, "review_count": 640, "monthly_sales": 580},
+        {"title": "Outdoor Vacuum Bottle", "price": 27.95, "rating": 4.5, "review_count": 1520, "monthly_sales": 860},
+    ]
+
+    competitors: list[dict[str, Any]] = []
+    seed = (asin or "B000000000")[-4:]
+
+    for mkt_index, marketplace in enumerate(target_marketplaces):
+        price_shift = mkt_index * 0.75
+        sales_shift = mkt_index * 40
+        review_shift = mkt_index * 120
+
+        for item_index, template in enumerate(templates, start=1):
+            competitors.append(
+                {
+                    "marketplace": marketplace,
+                    "asin": f"{seed}{marketplace}{item_index:02d}",
+                    "title": f"{template['title']} ({marketplace})",
+                    "price": round(float(template["price"]) + price_shift, 2),
+                    "rating": float(template["rating"]),
+                    "review_count": int(template["review_count"]) + review_shift,
+                    "monthly_sales": int(template["monthly_sales"]) + sales_shift,
+                }
+            )
+
+    return competitors
+
+
 def _parse_js_response(response: Any, marketplace: str) -> list[dict[str, Any]]:
     """
     Parse a Jungle Scout product_database response into a list of competitor dicts.
@@ -643,7 +677,7 @@ def _save_results(
             launch_id,
             pursuit_score=score,
             pursuit_category=category,
-            current_stage=1,
+            current_stage=2,
         )
         conn.commit()
 
@@ -738,12 +772,26 @@ def main() -> None:
     if fetch_disabled and not asin:
         st.info("Enter a Source ASIN above to enable data fetching.")
 
-    if st.button(
-        "🔍 Fetch Market Data",
-        disabled=fetch_disabled,
-        type="secondary",
-        use_container_width=False,
-    ):
+    fetch_col, mock_col = st.columns([3, 2])
+
+    with fetch_col:
+        fetch_clicked = st.button(
+            "🔍 Fetch Market Data",
+            disabled=fetch_disabled,
+            type="secondary",
+            use_container_width=False,
+        )
+
+    with mock_col:
+        mock_clicked = st.button(
+            "🧪 Use Mock Data",
+            disabled=fetch_disabled,
+            type="secondary",
+            help="Populate competitor data without calling Jungle Scout.",
+            use_container_width=False,
+        )
+
+    if fetch_clicked:
         if not asin:
             st.error("❌ Please enter a Source ASIN.")
         elif len(asin) < 10:
@@ -771,6 +819,24 @@ def main() -> None:
                     st.success(f"✅ Fetched {len(competitors)} competitors across {len(target_marketplaces)} marketplace(s).")
                 else:
                     st.warning("⚠️ No competitors found. Try adjusting your filters or check the ASIN.")
+
+    if mock_clicked:
+        if not asin:
+            st.error("❌ Please enter a Source ASIN.")
+        elif len(asin) < 10:
+            st.error("❌ ASIN must be at least 10 characters (e.g. B08N5WRWNW).")
+        elif not target_marketplaces:
+            st.error("❌ Please select at least one target marketplace.")
+        else:
+            competitors = _build_mock_competitors(asin, target_marketplaces)
+            st.session_state["competitor_data"] = competitors
+            st.session_state["pursuit_score"] = None
+            st.session_state["pursuit_category"] = None
+            st.session_state["score_breakdown"] = None
+            st.success(
+                f"✅ Loaded {len(competitors)} mock competitors across "
+                f"{len(target_marketplaces)} marketplace(s). No API calls used."
+            )
 
     # --- Competitor table ---
     competitors = st.session_state.get("competitor_data")

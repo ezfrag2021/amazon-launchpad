@@ -258,13 +258,14 @@ def _validate_stage3(launch: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 def _render_listing_inputs(launch: dict[str, Any]) -> None:
     st.subheader("✍️ Listing Generation")
+    launch_description = (launch.get("product_description") or "")
 
     col1, col2 = st.columns(2)
 
     with col1:
         product_name = st.text_input(
             "Product Name / Title",
-            value=st.session_state.get("cs_product_name") or launch.get("product_description", "")[:100],
+            value=st.session_state.get("cs_product_name") or launch_description[:100],
             placeholder="e.g. Premium Stainless Steel Water Bottle 32oz",
             key="cs_product_name_input",
             help="Auto-populated from Stage 1 product description.",
@@ -765,8 +766,9 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
     st.caption("Amazon requires 7 images for optimal listing performance.")
 
     launch_id = launch["launch_id"]
-    product_name = st.session_state.get("cs_product_name") or launch.get("product_description", "Product")
-    product_desc = launch.get("product_description", "")
+    launch_description = (launch.get("product_description") or "")
+    product_name = st.session_state.get("cs_product_name") or launch_description or "Product"
+    product_desc = launch_description
 
     # Load existing gallery from DB
     db_gallery = _load_image_gallery(launch_id)

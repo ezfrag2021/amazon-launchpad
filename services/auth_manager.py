@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from google.oauth2 import service_account
-import google.generativeai as genai
 
 # Default key filename shared with amazon-mi
 _DEFAULT_KEY_FILENAME = "gen-lang-client-0422857398-6a11b7435ae6.json"
@@ -50,7 +49,16 @@ def get_generative_client() -> Any:
     Raises:
         FileNotFoundError: If the service account key file does not exist.
         google.auth.exceptions.TransportError: On credential refresh failures.
+        ImportError: If google-generativeai package is not installed.
     """
+    try:
+        import google.generativeai as genai  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "google-generativeai is not installed. "
+            "Run: pip install 'google-generativeai>=0.3,<1'"
+        ) from exc
+
     key_path = resolve_service_account_key_path()
 
     if not key_path.exists():
