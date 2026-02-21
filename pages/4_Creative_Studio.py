@@ -8,14 +8,13 @@ Manages 7-slot image gallery following Amazon best practices.
 
 from __future__ import annotations
 
-import base64
 import csv
+import base64
 import hashlib
 import io
 import json
 import logging
 import os
-import random
 import re
 import time
 import zipfile
@@ -29,8 +28,27 @@ from psycopg import errors
 from psycopg.rows import dict_row
 
 from services.auth_manager import get_generative_client, get_vertex_genai_client
+from services.creative_gallery import (
+    image_gallery_supports_binary,
+    load_image_gallery,
+    save_image_to_gallery,
+)
 from services.db_connection import connect, resolve_dsn
+from services.imagen_quota import (
+    call_with_quota_retry as quota_call_with_retry,
+    is_quota_error as quota_is_quota_error,
+    mark_imagen_request_attempt as quota_mark_request_attempt,
+    seconds_until_next_image_request as quota_seconds_until_next_request,
+)
 from services.launch_state import LaunchStateManager
+from services.listing_policy import (
+    DEFAULT_EU_UK_RESTRICTED_MARKETING_PHRASES,
+    DEFAULT_GLOBAL_PROHIBITED_LISTING_TERMS,
+    effective_blocked_phrases,
+    normalize_listing_with_policy,
+    normalize_policy_rows,
+    split_phrase_lines,
+)
 from services.workflow_ui import (
     record_section_save,
     render_readiness_panel,
@@ -137,66 +155,12 @@ AMAZON_LIMITS = {
     "backend_keywords": 250,
 }
 
-EU_UK_MARKETPLACES = {"UK", "DE", "FR", "IT", "ES"}
-
-DEFAULT_EU_UK_RESTRICTED_MARKETING_PHRASES = [
-    "physician recommended",
-    "physician-recommended",
-    "doctor recommended",
-    "clinically proven",
-    "clinically tested",
-    "medical grade",
-    "therapeutic",
-    "heals",
-    "cures",
-    "treats",
-    "prevents disease",
-    "BPA free",
-    "BPA-free",
-    "phthalate free",
-    "phthalate-free",
-    "non toxic",
-    "non-toxic",
-    "chemical free",
-    "chemical-free",
-]
-
-DEFAULT_GLOBAL_PROHIBITED_LISTING_TERMS = [
-    "#1",
-    "number one",
-    "best seller",
-    "guaranteed",
-    "risk free",
-    "100% safe",
-    "FDA approved",
-    "CE certified",
-    "genuine",
-    "authentic",
-    "free shipping",
-    "click here",
-    "buy now",
-    "limited time",
-    "cancer",
-    "arthritis",
-    "diabetes",
-    "covid",
-    "aspirin",
-    "ibuprofen",
-    "tylenol",
-    "nike",
-    "adidas",
-    "apple",
-    "samsung",
-    "amazon basics",
-]
-
 # Load environment variables
 load_dotenv()
 
 GEMINI_MODEL = os.getenv("CREATIVE_GEMINI_MODEL", "gemini-2.5-flash")
 IMAGEN_MODEL = os.getenv("CREATIVE_IMAGEN_MODEL", "imagen-3.0-generate-002")
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
-INLINE_IMAGE_PREFIX = "inline:base64,"
 IMAGEN_RETRY_MAX_ATTEMPTS = max(0, int(os.getenv("CREATIVE_IMAGEN_MAX_RETRIES", "4")))
 IMAGEN_RETRY_BASE_SECONDS = max(
     0.25, float(os.getenv("CREATIVE_IMAGEN_RETRY_BASE_SECONDS", "1.5"))
@@ -483,6 +447,25 @@ def _strip_markdown_fences(raw_text: str) -> str:
         lines = text.split("\n")
         text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
     return text.strip()
+
+
+def _parse_json_object_from_text(raw_text: str) -> dict[str, Any]:
+    text = _strip_markdown_fences(raw_text)
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        parsed = json.loads(text[start : end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+
+    raise json.JSONDecodeError("Could not parse JSON object", text, 0)
 
 
 _ISO_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
@@ -822,7 +805,9 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
                            rufus_optimized, a_plus_content
                     FROM launchpad.listing_drafts
                     WHERE launch_id = %s
-                    ORDER BY (marketplace = %s) DESC, generated_at DESC
+                    ORDER BY (a_plus_content IS NOT NULL) DESC,
+                             (marketplace = %s) DESC,
+                             generated_at DESC
                     LIMIT 1
                     """,
                     (launch_id, preferred_mp),
@@ -868,6 +853,7 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
         )
         st.session_state["cs_rufus_optimize"] = bool(row.get("rufus_optimized"))
         st.session_state["cs_include_aplus"] = bool(aplus)
+        _hydrate_aplus_package_from_listing_content(launch_id, aplus)
 
         backend_keywords = str(row.get("backend_keywords") or "")
         if backend_keywords:
@@ -1031,21 +1017,6 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
                     st.rerun()
 
 
-def _split_phrase_lines(raw_text: str) -> list[str]:
-    phrases: list[str] = []
-    seen: set[str] = set()
-    for line in (raw_text or "").splitlines():
-        item = " ".join(line.strip().split())
-        if not item:
-            continue
-        key = item.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        phrases.append(item)
-    return phrases
-
-
 @st.cache_data(show_spinner=False, ttl=300)
 def _load_listing_policy_terms() -> dict[str, Any]:
     fallback = {
@@ -1067,13 +1038,7 @@ def _load_listing_policy_terms() -> dict[str, Any]:
                 rows = cur.fetchall()
         if not rows:
             return fallback
-
-        scoped: dict[str, list[str]] = {"global": [], "eu_uk": []}
-        for row in rows:
-            scope = str(row.get("scope") or "").strip().lower()
-            term = " ".join(str(row.get("term") or "").strip().split())
-            if scope in scoped and term:
-                scoped[scope].append(term)
+        scoped = normalize_policy_rows([dict(row) for row in rows])
         if not scoped["global"] and not scoped["eu_uk"]:
             return fallback
         return {"global": scoped["global"], "eu_uk": scoped["eu_uk"], "source": "db"}
@@ -1087,8 +1052,8 @@ def _load_listing_policy_terms() -> dict[str, Any]:
 def _save_listing_policy_terms_to_db(global_terms: str, eu_uk_terms: str) -> bool:
     try:
         desired = {
-            "global": _split_phrase_lines(global_terms),
-            "eu_uk": _split_phrase_lines(eu_uk_terms),
+            "global": split_phrase_lines(global_terms),
+            "eu_uk": split_phrase_lines(eu_uk_terms),
         }
         with _open_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -1149,165 +1114,28 @@ def _save_listing_policy_terms_to_db(global_terms: str, eu_uk_terms: str) -> boo
         return False
 
 
+def _current_policy_terms() -> dict[str, Any]:
+    return _load_listing_policy_terms()
+
+
 def _effective_blocked_phrases(marketplace: str) -> list[str]:
-    policy_terms = _load_listing_policy_terms()
-    phrases = list(policy_terms.get("global", []))
-    if marketplace in EU_UK_MARKETPLACES:
-        phrases.extend(policy_terms.get("eu_uk", []))
-    phrases.extend(
-        _split_phrase_lines(st.session_state.get("cs_additional_blocked_terms", ""))
+    return effective_blocked_phrases(
+        marketplace=marketplace,
+        policy_terms=_current_policy_terms(),
+        additional_terms_raw=st.session_state.get("cs_additional_blocked_terms", ""),
     )
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for phrase in phrases:
-        key = phrase.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(phrase)
-    return deduped
-
-
-def _strip_blocked_phrases(
-    text: str, blocked_phrases: list[str]
-) -> tuple[str, list[str]]:
-    cleaned = str(text or "")
-    removed: list[str] = []
-    for phrase in sorted(blocked_phrases, key=len, reverse=True):
-        pattern = re.compile(rf"\b{re.escape(phrase)}\b", flags=re.IGNORECASE)
-        if pattern.search(cleaned):
-            cleaned = pattern.sub(" ", cleaned)
-            removed.append(phrase)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned, removed
-
-
-def _truncate_to_chars(text: str, max_chars: int) -> tuple[str, int]:
-    value = str(text or "")
-    if len(value) <= max_chars:
-        return value, 0
-    sliced = value[:max_chars]
-    if " " in sliced and max_chars > 20:
-        sliced = sliced.rsplit(" ", 1)[0].strip()
-        if not sliced:
-            sliced = value[:max_chars]
-    return sliced, len(value) - len(sliced)
-
-
-def _truncate_to_utf8_bytes(text: str, max_bytes: int) -> tuple[str, int]:
-    value = str(text or "")
-    encoded = value.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return value, 0
-    out: list[str] = []
-    used = 0
-    for token in value.split():
-        token_bytes = len(token.encode("utf-8"))
-        spacer = 1 if out else 0
-        if used + spacer + token_bytes > max_bytes:
-            break
-        if spacer:
-            out.append(" ")
-            used += 1
-        out.append(token)
-        used += token_bytes
-    trimmed = "".join(out).strip()
-    if not trimmed:
-        trimmed = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    return trimmed, len(encoded) - len(trimmed.encode("utf-8"))
 
 
 def _normalize_listing_with_policy(
     listing: dict[str, Any], marketplace: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    normalized = dict(listing or {})
-    report: dict[str, Any] = {
-        "removed_phrases": [],
-        "truncated_fields": {},
-        "marketplace": marketplace,
-    }
-
-    title = str(normalized.get("title") or "").strip()
-    bullets_raw = normalized.get("bullets") or []
-    if not isinstance(bullets_raw, list):
-        bullets_raw = [str(bullets_raw)]
-    bullets = [str(b or "").strip() for b in bullets_raw if str(b or "").strip()]
-    while len(bullets) < 5:
-        bullets.append("")
-    bullets = bullets[:5]
-
-    description = str(normalized.get("description") or "").strip()
-    backend = str(normalized.get("backend_keywords") or "").replace(",", " ").strip()
-
-    if st.session_state.get("cs_enforce_listing_policy", True):
-        blocked = _effective_blocked_phrases(marketplace)
-
-        title, removed_title = _strip_blocked_phrases(title, blocked)
-        description, removed_desc = _strip_blocked_phrases(description, blocked)
-        backend, removed_backend = _strip_blocked_phrases(backend, blocked)
-
-        cleaned_bullets: list[str] = []
-        removed_bullets: list[str] = []
-        for bullet in bullets:
-            clean_b, removed_b = _strip_blocked_phrases(bullet, blocked)
-            cleaned_bullets.append(clean_b)
-            removed_bullets.extend(removed_b)
-        bullets = cleaned_bullets
-
-        removed_phrases = sorted(
-            {
-                p.lower()
-                for p in removed_title
-                + removed_desc
-                + removed_backend
-                + removed_bullets
-            }
-        )
-        report["removed_phrases"] = removed_phrases
-
-    title, title_trimmed = _truncate_to_chars(title, AMAZON_LIMITS["title"])
-    if title_trimmed > 0:
-        report["truncated_fields"]["title"] = title_trimmed
-
-    desc, desc_trimmed = _truncate_to_chars(description, AMAZON_LIMITS["description"])
-    description = desc
-    if desc_trimmed > 0:
-        report["truncated_fields"]["description"] = desc_trimmed
-
-    limited_bullets: list[str] = []
-    for idx, bullet in enumerate(bullets, 1):
-        clipped, clipped_count = _truncate_to_chars(bullet, AMAZON_LIMITS["bullet"])
-        limited_bullets.append(clipped)
-        if clipped_count > 0:
-            report["truncated_fields"][f"bullet_{idx}"] = clipped_count
-    bullets = limited_bullets
-
-    backend_tokens = []
-    seen_tokens: set[str] = set()
-    content_tokens = set(
-        re.findall(r"[a-z0-9]+", f"{title} {' '.join(bullets)}".lower())
+    return normalize_listing_with_policy(
+        listing=listing,
+        marketplace=marketplace,
+        amazon_limits=AMAZON_LIMITS,
+        enforce_policy=st.session_state.get("cs_enforce_listing_policy", True),
+        blocked_phrases=_effective_blocked_phrases(marketplace),
     )
-    for token in backend.split():
-        key = token.lower()
-        if key in seen_tokens:
-            continue
-        if key in content_tokens:
-            continue
-        seen_tokens.add(key)
-        backend_tokens.append(token)
-    backend = " ".join(backend_tokens)
-    backend, backend_trimmed = _truncate_to_utf8_bytes(
-        backend, AMAZON_LIMITS["backend_keywords"]
-    )
-    if backend_trimmed > 0:
-        report["truncated_fields"]["backend_keywords_bytes"] = backend_trimmed
-
-    normalized["title"] = title
-    normalized["bullets"] = bullets
-    normalized["description"] = description
-    normalized["backend_keywords"] = backend
-    return normalized, report
 
 
 def _build_listing_prompt(
@@ -1403,14 +1231,7 @@ def _generate_listing(
         )
 
         response = model.generate_content(prompt)
-        raw_text = response.text.strip()
-
-        # Strip markdown code fences if present
-        if raw_text.startswith("```"):
-            lines = raw_text.split("\n")
-            raw_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-
-        parsed = json.loads(raw_text)
+        parsed = _parse_json_object_from_text(str(getattr(response, "text", "") or ""))
         if not isinstance(parsed, dict):
             st.error("❌ AI response did not match expected listing object.")
             return None, None
@@ -1428,6 +1249,59 @@ def _generate_listing(
         st.error(f"❌ Listing generation failed: {exc}")
         logger.error("Listing generation error: %s", exc)
         return None, None
+
+
+def _compute_listing_constraint_score(listing: dict[str, Any]) -> tuple[int, list[str]]:
+    title = str(listing.get("title") or "")
+    bullets = listing.get("bullets") or []
+    if not isinstance(bullets, list):
+        bullets = []
+    bullets_clean = [str(b or "").strip() for b in bullets if str(b or "").strip()]
+    description = str(listing.get("description") or "")
+    backend_keywords = str(listing.get("backend_keywords") or "")
+
+    target_keywords = [
+        k.strip().lower()
+        for k in re.split(
+            r"[,\n]", str(st.session_state.get("cs_target_keywords") or "")
+        )
+        if k.strip()
+    ]
+    primary_kw = target_keywords[0] if target_keywords else ""
+
+    checks = [
+        (
+            len(title) <= AMAZON_LIMITS["title"] and bool(title.strip()),
+            "Title present and within 200 characters",
+        ),
+        (
+            (not primary_kw) or (primary_kw in title[:80].lower()),
+            "Primary keyword appears in first 80 title characters",
+        ),
+        (
+            len(bullets_clean) >= 5,
+            "Five non-empty bullet points",
+        ),
+        (
+            all(len(b) <= AMAZON_LIMITS["bullet"] for b in bullets_clean),
+            "All bullets within 500 characters",
+        ),
+        (
+            len(description) <= AMAZON_LIMITS["description"]
+            and len(description.strip()) >= 200,
+            "Description within 2000 characters and sufficiently detailed",
+        ),
+        (
+            len(backend_keywords.encode("utf-8")) <= AMAZON_LIMITS["backend_keywords"]
+            and bool(backend_keywords.strip()),
+            "Backend keywords within 250 bytes and non-empty",
+        ),
+    ]
+
+    passed = [label for ok, label in checks if ok]
+    failed = [label for ok, label in checks if not ok]
+    score = int(round((len(passed) / max(1, len(checks))) * 100))
+    return score, failed
 
 
 def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
@@ -1528,6 +1402,23 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
         notes = listing.get("quality_notes", [])
         for note in notes:
             st.caption(f"• {note}")
+
+    constraint_score, improvement_items = _compute_listing_constraint_score(edited)
+    with st.expander("ℹ️ How this score works", expanded=False):
+        st.markdown(
+            "- `quality_score` is generated by Gemini as a model self-assessment, so it is advisory rather than deterministic."
+        )
+        st.markdown(
+            f"- Constraint score: **{constraint_score}/100** based on enforceable checks (length, structure, keyword placement)."
+        )
+        if improvement_items:
+            st.markdown("- To move toward **100/100**, address these items:")
+            for item in improvement_items:
+                st.markdown(f"  - {item}")
+        else:
+            st.markdown(
+                "- All enforceable checks pass. To reach 100/100 model score, improve clarity, keyword naturalness, and conversion strength, then regenerate."
+            )
 
     # Optimization suggestions
     suggestions = listing.get("optimization_suggestions", [])
@@ -1712,121 +1603,36 @@ def _extract_generated_image_bytes(result: Any) -> bytes | None:
 @st.cache_resource(show_spinner=False)
 def _image_gallery_supports_binary() -> bool:
     """Return True when launchpad.image_gallery has image_bytes column."""
-    try:
-        with _open_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM information_schema.columns
-                        WHERE table_schema = 'launchpad'
-                          AND table_name = 'image_gallery'
-                          AND column_name = 'image_bytes'
-                    )
-                    """
-                )
-                row = cur.fetchone()
-                return bool(row and row[0])
-    except Exception as exc:
-        logger.warning("Could not verify image_gallery schema: %s", exc)
-        return False
-
-
-def _encode_inline_image(image_bytes: bytes) -> str:
-    return f"{INLINE_IMAGE_PREFIX}{base64.b64encode(image_bytes).decode('ascii')}"
-
-
-def _decode_inline_image(storage_path: str | None) -> bytes | None:
-    if not storage_path or not storage_path.startswith(INLINE_IMAGE_PREFIX):
-        return None
-    payload = storage_path[len(INLINE_IMAGE_PREFIX) :]
-    try:
-        return base64.b64decode(payload, validate=True)
-    except Exception:
-        return None
+    return image_gallery_supports_binary(_open_conn, logger)
 
 
 def _is_quota_error(exc: Exception) -> bool:
-    err = str(exc).upper()
-    return (
-        "RESOURCE_EXHAUSTED" in err
-        or "TOO MANY REQUESTS" in err
-        or "RATE LIMIT" in err
-        or "QUOTA" in err
-        or "429" in err
-    )
-
-
-def _extract_retry_after_seconds(exc: Exception) -> float | None:
-    match = re.search(r"RETRY[-_ ]?AFTER[^0-9]*([0-9]+(?:\.[0-9]+)?)", str(exc), re.I)
-    if not match:
-        return None
-    try:
-        return max(0.0, float(match.group(1)))
-    except Exception:
-        return None
+    return quota_is_quota_error(exc)
 
 
 def _seconds_until_next_image_request(enforce_strict_spacing: bool = False) -> int:
-    now = time.time()
-    quota_until = float(
-        st.session_state.get("cs_imagen_quota_cooldown_until", 0.0) or 0.0
+    return quota_seconds_until_next_request(
+        session=st.session_state,
+        strict_spacing_seconds=IMAGEN_STRICT_CALL_SPACING_SECONDS,
+        enforce_strict_spacing=enforce_strict_spacing,
     )
-    strict_enabled = enforce_strict_spacing and bool(
-        st.session_state.get("cs_imagen_strict_spacing", True)
-    )
-    strict_remaining = 0.0
-    if strict_enabled:
-        last_call = float(st.session_state.get("cs_imagen_last_request_at", 0.0) or 0.0)
-        strict_remaining = max(
-            0.0, IMAGEN_STRICT_CALL_SPACING_SECONDS - (now - last_call)
-        )
-    return int(max(0.0, quota_until - now, strict_remaining))
 
 
 def _mark_imagen_request_attempt() -> None:
-    st.session_state["cs_imagen_last_request_at"] = time.time()
+    quota_mark_request_attempt(st.session_state)
 
 
 def _call_with_quota_retry(op_name: str, fn: Any) -> Any:
-    last_exc: Exception | None = None
-    for attempt in range(IMAGEN_RETRY_MAX_ATTEMPTS + 1):
-        try:
-            return fn()
-        except Exception as exc:
-            last_exc = exc
-            if not _is_quota_error(exc) or attempt >= IMAGEN_RETRY_MAX_ATTEMPTS:
-                raise
-
-            retry_after = _extract_retry_after_seconds(exc)
-            backoff = min(
-                IMAGEN_RETRY_MAX_SECONDS,
-                IMAGEN_RETRY_BASE_SECONDS
-                * (2**attempt)
-                * (1.0 + random.random() * 0.25),
-            )
-            delay_seconds = max(
-                retry_after or 0.0,
-                backoff,
-                IMAGEN_QUOTA_COOLDOWN_SECONDS,
-            )
-            st.session_state["cs_imagen_quota_cooldown_until"] = (
-                time.time() + delay_seconds
-            )
-            logger.warning(
-                "Quota/rate limit for %s (attempt %s/%s). Retrying in %.2fs: %s",
-                op_name,
-                attempt + 1,
-                IMAGEN_RETRY_MAX_ATTEMPTS + 1,
-                delay_seconds,
-                exc,
-            )
-            time.sleep(delay_seconds)
-
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"{op_name} failed before request execution")
+    return quota_call_with_retry(
+        op_name=op_name,
+        fn=fn,
+        session=st.session_state,
+        max_attempts=IMAGEN_RETRY_MAX_ATTEMPTS,
+        base_seconds=IMAGEN_RETRY_BASE_SECONDS,
+        max_seconds=IMAGEN_RETRY_MAX_SECONDS,
+        quota_cooldown_seconds=IMAGEN_QUOTA_COOLDOWN_SECONDS,
+        logger=logger,
+    )
 
 
 def _generate_image_with_imagen(
@@ -1952,111 +1758,28 @@ def _save_image_to_gallery(
     storage_path: str | None = None,
 ) -> bool:
     """Save image metadata to DB. Returns True on success."""
-    try:
-        supports_binary = _image_gallery_supports_binary()
-        storage_value = storage_path
-        if not supports_binary and image_bytes:
-            storage_value = _encode_inline_image(image_bytes)
-
-        with _open_conn() as conn:
-            with conn.cursor() as cur:
-                if supports_binary:
-                    cur.execute(
-                        """
-                        INSERT INTO launchpad.image_gallery
-                            (launch_id, slot_number, image_type, prompt_used, storage_path, model_used, image_bytes)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (launch_id, slot_number) DO UPDATE SET
-                            image_type   = EXCLUDED.image_type,
-                            prompt_used  = EXCLUDED.prompt_used,
-                            storage_path = EXCLUDED.storage_path,
-                            model_used   = EXCLUDED.model_used,
-                            image_bytes  = EXCLUDED.image_bytes,
-                            generated_at = now()
-                        """,
-                        (
-                            launch_id,
-                            slot_number,
-                            image_type,
-                            prompt_used,
-                            storage_value,
-                            model_used,
-                            image_bytes,
-                        ),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO launchpad.image_gallery
-                            (launch_id, slot_number, image_type, prompt_used, storage_path, model_used)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (launch_id, slot_number) DO UPDATE SET
-                            image_type   = EXCLUDED.image_type,
-                            prompt_used  = EXCLUDED.prompt_used,
-                            storage_path = EXCLUDED.storage_path,
-                            model_used   = EXCLUDED.model_used,
-                            generated_at = now()
-                        """,
-                        (
-                            launch_id,
-                            slot_number,
-                            image_type,
-                            prompt_used,
-                            storage_value,
-                            model_used,
-                        ),
-                    )
-            conn.commit()
-            return True
-    except Exception as exc:
-        logger.error("Image gallery save error: %s", exc)
-        return False
+    return save_image_to_gallery(
+        open_conn=_open_conn,
+        launch_id=launch_id,
+        slot_number=slot_number,
+        image_type=image_type,
+        prompt_used=prompt_used,
+        image_bytes=image_bytes,
+        model_used=model_used,
+        storage_path=storage_path,
+        supports_binary=_image_gallery_supports_binary(),
+        logger=logger,
+    )
 
 
 def _load_image_gallery(launch_id: int) -> dict[int, dict[str, Any]]:
     """Load image gallery records for a launch. Returns dict keyed by slot_number."""
-    try:
-        supports_binary = _image_gallery_supports_binary()
-        with _open_conn() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                if supports_binary:
-                    cur.execute(
-                        """
-                        SELECT slot_number, image_type, prompt_used, storage_path, image_bytes,
-                               model_used, generated_at
-                        FROM launchpad.image_gallery
-                        WHERE launch_id = %s
-                        ORDER BY slot_number
-                        """,
-                        (launch_id,),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT slot_number, image_type, prompt_used, storage_path,
-                               NULL::bytea AS image_bytes, model_used, generated_at
-                        FROM launchpad.image_gallery
-                        WHERE launch_id = %s
-                        ORDER BY slot_number
-                        """,
-                        (launch_id,),
-                    )
-                rows = cur.fetchall()
-        gallery: dict[int, dict[str, Any]] = {}
-        for row in rows:
-            data = dict(row)
-            maybe_image = data.get("image_bytes")
-            if isinstance(maybe_image, memoryview):
-                data["image_bytes"] = maybe_image.tobytes()
-            elif not maybe_image:
-                inline_image = _decode_inline_image(data.get("storage_path"))
-                if inline_image:
-                    data["image_bytes"] = inline_image
-            gallery[int(row["slot_number"])] = data
-        return gallery
-    except Exception as exc:
-        logger.warning("Could not load image gallery: %s", exc)
-        return {}
+    return load_image_gallery(
+        open_conn=_open_conn,
+        launch_id=launch_id,
+        supports_binary=_image_gallery_supports_binary(),
+        logger=logger,
+    )
 
 
 def _slot_has_image(data: dict[str, Any] | None) -> bool:
@@ -2426,13 +2149,23 @@ Rules:
 - Avoid medical/legal claims.
 """
         response = model.generate_content(prompt)
-        parsed = json.loads(
-            _strip_markdown_fences(str(getattr(response, "text", "") or ""))
-        )
+        parsed = _parse_json_object_from_text(str(getattr(response, "text", "") or ""))
         if not isinstance(parsed, dict):
             return None
         return parsed
+    except json.JSONDecodeError as exc:
+        st.error(
+            f"❌ A+ copy generation returned invalid JSON: {exc}. "
+            "Try regenerate; if repeated, reduce prompt complexity."
+        )
+        logger.error("A+ copy JSON parse failed: %s", exc)
+        return None
+    except FileNotFoundError as exc:
+        st.error(f"❌ Google credentials not found: {exc}")
+        logger.error("A+ credentials missing: %s", exc)
+        return None
     except Exception as exc:
+        st.error(f"❌ A+ copy generation error: {exc}")
         logger.error("A+ copy generation failed: %s", exc)
         return None
 
@@ -2468,6 +2201,73 @@ def _build_aplus_image_prompts(aplus_copy: dict[str, Any]) -> dict[str, str]:
             row.get("image_prompt") or f"Feature tile {idx + 1} product image."
         )
     return prompts
+
+
+def _serialize_aplus_assets_for_storage(
+    assets: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    serialized: dict[str, dict[str, Any]] = {}
+    for asset_key, asset in (assets or {}).items():
+        raw_bytes = asset.get("bytes") if isinstance(asset, dict) else None
+        encoded = (
+            base64.b64encode(raw_bytes).decode("ascii")
+            if isinstance(raw_bytes, bytes)
+            else None
+        )
+        serialized[asset_key] = {
+            "width": int(asset.get("width") or 0),
+            "height": int(asset.get("height") or 0),
+            "prompt": str(asset.get("prompt") or ""),
+            "used_reference": bool(asset.get("used_reference")),
+            "image_base64": encoded,
+        }
+    return serialized
+
+
+def _deserialize_aplus_assets_from_storage(
+    payload: Any,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}
+    restored: dict[str, dict[str, Any]] = {}
+    for asset_key, row in payload.items():
+        if not isinstance(row, dict):
+            continue
+        encoded = row.get("image_base64")
+        image_bytes: bytes | None = None
+        if isinstance(encoded, str) and encoded:
+            try:
+                image_bytes = base64.b64decode(encoded, validate=True)
+            except Exception:
+                image_bytes = None
+        if image_bytes:
+            restored[str(asset_key)] = {
+                "bytes": image_bytes,
+                "width": int(row.get("width") or 0),
+                "height": int(row.get("height") or 0),
+                "prompt": str(row.get("prompt") or ""),
+                "used_reference": bool(row.get("used_reference")),
+            }
+    return restored
+
+
+def _hydrate_aplus_package_from_listing_content(
+    launch_id: int,
+    aplus_content: Any,
+) -> None:
+    if not isinstance(aplus_content, dict):
+        return
+    assets = _deserialize_aplus_assets_from_storage(aplus_content.get("assets"))
+    if not assets:
+        return
+    st.session_state["cs_aplus_package"] = {
+        "launch_id": launch_id,
+        "generated_at": str(aplus_content.get("generated_at") or ""),
+        "copy": aplus_content.get("copy")
+        if isinstance(aplus_content.get("copy"), dict)
+        else {},
+        "assets": assets,
+    }
 
 
 def _aplus_asset_signature(
@@ -2508,6 +2308,10 @@ def _render_aplus_engine(
     )
 
     launch_id = int(launch["launch_id"])
+    if not st.session_state.get("cs_aplus_package") and listing is not None:
+        _hydrate_aplus_package_from_listing_content(
+            launch_id, listing.get("a_plus_content")
+        )
     gallery = st.session_state.get("cs_image_gallery", {})
     product_name = (
         st.session_state.get("cs_product_name")
@@ -2595,7 +2399,9 @@ def _render_aplus_engine(
                 )
                 if not aplus_copy:
                     st.session_state.pop("cs_aplus_quota_hits_current_run", None)
-                    st.error("❌ A+ copy generation failed.")
+                    st.warning(
+                        "A+ copy could not be generated. Review the detailed error above and retry."
+                    )
                     return
 
                 prompt_map = _build_aplus_image_prompts(aplus_copy)
@@ -2699,18 +2505,33 @@ def _render_aplus_engine(
                 st.session_state["cs_aplus_package"] = package
 
                 if listing is not None:
+                    serialized_assets = _serialize_aplus_assets_for_storage(assets)
                     listing["a_plus_content"] = {
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
                         "copy": aplus_copy,
-                        "assets": {
-                            k: {
-                                "width": v["width"],
-                                "height": v["height"],
-                                "prompt": v["prompt"],
-                            }
-                            for k, v in assets.items()
-                        },
+                        "assets": serialized_assets,
                     }
                     st.session_state["cs_edited_listing"] = listing
+
+                    active_marketplace = str(
+                        st.session_state.get("cs_active_marketplace")
+                        or (launch.get("target_marketplaces") or ["UK"])[0]
+                    )
+                    persisted = _save_listing_draft(
+                        launch_id=launch_id,
+                        marketplace=active_marketplace,
+                        listing=listing,
+                        rufus_optimized=st.session_state.get(
+                            "cs_rufus_optimize", False
+                        ),
+                    )
+                    if persisted:
+                        record_section_save(launch_id, "creative", "listing_draft")
+                    else:
+                        st.warning(
+                            "A+ assets were generated but could not be auto-saved to draft storage. "
+                            "Use Save Draft on the listing page to persist them."
+                        )
 
             if generated_count:
                 st.success(
@@ -2765,6 +2586,7 @@ def _render_aplus_engine(
             file_name=f"launch_{launch_id}_a_plus_package.zip",
             mime="application/zip",
             use_container_width=True,
+            on_click="ignore",
         )
 
 
@@ -2819,6 +2641,7 @@ def _render_version_management(launch_id: int, marketplace: str) -> None:
                     }
                     st.session_state["cs_generated_listing"] = restored
                     st.session_state["cs_edited_listing"] = restored
+                    _hydrate_aplus_package_from_listing_content(launch_id, aplus)
                     st.success(f"✅ Restored v{v['version']}!")
                     st.rerun()
 
@@ -2963,75 +2786,101 @@ def _render_final_review(
     st.markdown("**Export Options:**")
     col_e1, col_e2, col_e3 = st.columns(3)
 
-    with col_e1:
-        if listing and st.button("📄 Download Listing CSV", use_container_width=True):
-            csv_buf = io.StringIO()
-            writer = csv.writer(csv_buf)
-            writer.writerow(["Field", "Value"])
-            writer.writerow(["Title", listing.get("title", "")])
-            for i, b in enumerate(listing.get("bullets", []), 1):
-                writer.writerow([f"Bullet {i}", b])
-            writer.writerow(["Description", listing.get("description", "")])
-            writer.writerow(["Backend Keywords", listing.get("backend_keywords", "")])
-            st.download_button(
-                "⬇️ Download CSV",
-                data=csv_buf.getvalue(),
-                file_name=f"listing_{launch_id}.csv",
-                mime="text/csv",
+    csv_payload: str | None = None
+    if listing:
+        csv_buf = io.StringIO()
+        writer = csv.writer(csv_buf)
+        writer.writerow(["Field", "Value"])
+        writer.writerow(["Title", listing.get("title", "")])
+        for i, b in enumerate(listing.get("bullets", []), 1):
+            writer.writerow([f"Bullet {i}", b])
+        writer.writerow(["Description", listing.get("description", "")])
+        writer.writerow(["Backend Keywords", listing.get("backend_keywords", "")])
+        csv_payload = csv_buf.getvalue()
+
+    gallery_sources: dict[int, dict[str, Any]] = {}
+    for slot_num in range(1, 8):
+        if gallery.get(slot_num):
+            gallery_sources[slot_num] = dict(gallery.get(slot_num) or {})
+        if db_gallery.get(slot_num):
+            merged = gallery_sources.get(slot_num, {})
+            merged.update(
+                {k: v for k, v in (db_gallery.get(slot_num) or {}).items() if v}
             )
+            gallery_sources[slot_num] = merged
+
+    gallery_images: dict[int, bytes] = {}
+    for slot_num, data in gallery_sources.items():
+        maybe_image = data.get("image_bytes")
+        if isinstance(maybe_image, memoryview):
+            gallery_images[slot_num] = maybe_image.tobytes()
+        elif isinstance(maybe_image, bytes) and maybe_image:
+            gallery_images[slot_num] = maybe_image
+
+    images_zip_payload: bytes | None = None
+    if gallery_images:
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for slot_num, img_bytes in gallery_images.items():
+                slot_name = IMAGE_SLOTS[slot_num]["name"].replace(" ", "_").lower()
+                zf.writestr(f"slot_{slot_num}_{slot_name}.jpg", img_bytes)
+        images_zip_payload = zip_buf.getvalue()
+
+    report_lines = [
+        f"# Amazon Launch Report - Launch #{launch_id}",
+        f"ASIN: {launch['source_asin']}",
+        f"Category: {launch.get('product_category', '-')}",
+        f"Pursuit Score: {launch.get('pursuit_score', '-')} ({launch.get('pursuit_category', '-')})",
+        f"Images: {filled_slots}/7 slots filled",
+        "",
+    ]
+    if listing:
+        report_lines += [
+            "## Listing",
+            f"Title: {listing.get('title', '')}",
+            "",
+            "### Bullets",
+        ]
+        for b in listing.get("bullets", []):
+            report_lines.append(f"- {b}")
+        report_lines += [
+            "",
+            "### Backend Keywords",
+            listing.get("backend_keywords", ""),
+        ]
+    report_text = "\n".join(report_lines)
+
+    with col_e1:
+        st.download_button(
+            "📄 Download Listing CSV",
+            data=csv_payload or "",
+            file_name=f"listing_{launch_id}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=not bool(csv_payload),
+            on_click="ignore",
+        )
 
     with col_e2:
-        gallery_images = {
-            slot_num: data.get("image_bytes")
-            for slot_num, data in gallery.items()
-            if data.get("image_bytes")
-        }
-        if gallery_images and st.button(
-            "🖼️ Download Images ZIP", use_container_width=True
-        ):
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for slot_num, img_bytes in gallery_images.items():
-                    slot_name = IMAGE_SLOTS[slot_num]["name"].replace(" ", "_").lower()
-                    zf.writestr(f"slot_{slot_num}_{slot_name}.jpg", img_bytes)
-            st.download_button(
-                "⬇️ Download ZIP",
-                data=zip_buf.getvalue(),
-                file_name=f"images_{launch_id}.zip",
-                mime="application/zip",
-            )
+        st.download_button(
+            "🖼️ Download Images ZIP",
+            data=images_zip_payload or b"",
+            file_name=f"images_{launch_id}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            disabled=not bool(images_zip_payload),
+            on_click="ignore",
+        )
 
     with col_e3:
-        if st.button("📊 Generate Launch Report", use_container_width=True):
-            report_lines = [
-                f"# Amazon Launch Report — Launch #{launch_id}",
-                f"ASIN: {launch['source_asin']}",
-                f"Category: {launch.get('product_category', '—')}",
-                f"Pursuit Score: {launch.get('pursuit_score', '—')} ({launch.get('pursuit_category', '—')})",
-                f"Images: {filled_slots}/7 slots filled",
-                "",
-            ]
-            if listing:
-                report_lines += [
-                    "## Listing",
-                    f"Title: {listing.get('title', '')}",
-                    "",
-                    "### Bullets",
-                ]
-                for b in listing.get("bullets", []):
-                    report_lines.append(f"- {b}")
-                report_lines += [
-                    "",
-                    "### Backend Keywords",
-                    listing.get("backend_keywords", ""),
-                ]
-            report_text = "\n".join(report_lines)
-            st.download_button(
-                "⬇️ Download Report",
-                data=report_text,
-                file_name=f"launch_report_{launch_id}.md",
-                mime="text/markdown",
-            )
+        st.download_button(
+            "📊 Download Launch Report",
+            data=report_text,
+            file_name=f"launch_report_{launch_id}.md",
+            mime="text/markdown",
+            use_container_width=True,
+            on_click="ignore",
+        )
 
 
 # ---------------------------------------------------------------------------
