@@ -587,11 +587,18 @@ def _build_compliance_audit_report(
 ) -> str:
     """Build a markdown audit report for compliance review."""
     generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    launch_name = str(launch.get("launch_name") or "").strip()
+    launch_title = (
+        f"Launch #{launch.get('launch_id')} - {launch_name}"
+        if launch_name
+        else f"Launch #{launch.get('launch_id')}"
+    )
     lines = [
-        f"# Compliance Risk Assessment Report - Launch #{launch.get('launch_id')}",
+        f"# Compliance Risk Assessment Report - {launch_title}",
         "",
         "## Audit Metadata",
         f"- Generated at (UTC): {generated_at}",
+        f"- Opportunity Name: {launch_name or 'N/A'}",
         f"- Source ASIN: {launch.get('source_asin') or 'N/A'}",
         f"- Source Marketplace: {launch.get('source_marketplace') or 'US'}",
         f"- Product Description: {launch.get('product_description') or 'N/A'}",
@@ -674,6 +681,12 @@ def _build_compliance_audit_report(
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _filename_safe_token(value: str, max_len: int = 48) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+    cleaned = "_".join(part for part in cleaned.split("_") if part)
+    return cleaned[:max_len].strip("_")
 
 
 # ---------------------------------------------------------------------------
@@ -1692,10 +1705,21 @@ if existing_checklist:
         for ch in str(selected_launch.get("source_asin") or "").upper()
         if ch.isalnum()
     )
+    launch_name_for_file = _filename_safe_token(
+        str(selected_launch.get("launch_name") or "")
+    )
     report_filename = (
-        f"compliance_audit_launch_{lid}_{asin_for_name}_{stamp}.md"
-        if asin_for_name
-        else f"compliance_audit_launch_{lid}_{stamp}.md"
+        f"compliance_audit_launch_{lid}_{launch_name_for_file}_{asin_for_name}_{stamp}.md"
+        if launch_name_for_file and asin_for_name
+        else (
+            f"compliance_audit_launch_{lid}_{launch_name_for_file}_{stamp}.md"
+            if launch_name_for_file
+            else (
+                f"compliance_audit_launch_{lid}_{asin_for_name}_{stamp}.md"
+                if asin_for_name
+                else f"compliance_audit_launch_{lid}_{stamp}.md"
+            )
+        )
     )
 
     export_col1, export_col2 = st.columns([2, 3])
@@ -1719,12 +1743,20 @@ if existing_checklist:
         else:
             st.caption("Drive path: `Launch_<id>_<ASIN>/Compliance/<YYYY-MM-DD>/`")
 
-        if st.button(
-            "☁️ Save Full Audit Report to Google Drive",
+        upload_md_clicked = st.button(
+            "☁️ Save Audit (.md) to Google Drive",
             type="primary",
             use_container_width=True,
-            key=f"cc_upload_audit_{lid}",
-        ):
+            key=f"cc_upload_audit_md_{lid}",
+        )
+        upload_doc_clicked = st.button(
+            "📝 Save Audit as Google Doc",
+            use_container_width=True,
+            key=f"cc_upload_audit_doc_{lid}",
+            help="Converts markdown into a native Google Doc for easier reading and sharing.",
+        )
+
+        if upload_md_clicked or upload_doc_clicked:
             if not isinstance(risk_assessment_report, dict):
                 st.warning(
                     "Generate AI Risk Assessment first, then export the full audit report."
@@ -1736,21 +1768,32 @@ if existing_checklist:
             else:
                 try:
                     from services.drive_audit import (
+                        upload_markdown_gdoc_to_launch_audit_folder,
                         upload_markdown_report_to_launch_audit_folder,
                     )
 
-                    uploaded = upload_markdown_report_to_launch_audit_folder(
-                        report_text=report_text,
-                        file_name=report_filename,
-                        root_folder_id=drive_folder_id,
-                        launch_id=lid,
-                        source_asin=str(selected_launch.get("source_asin") or ""),
-                    )
+                    if upload_doc_clicked:
+                        uploaded = upload_markdown_gdoc_to_launch_audit_folder(
+                            report_text=report_text,
+                            file_name=report_filename,
+                            root_folder_id=drive_folder_id,
+                            launch_id=lid,
+                            source_asin=str(selected_launch.get("source_asin") or ""),
+                        )
+                    else:
+                        uploaded = upload_markdown_report_to_launch_audit_folder(
+                            report_text=report_text,
+                            file_name=report_filename,
+                            root_folder_id=drive_folder_id,
+                            launch_id=lid,
+                            source_asin=str(selected_launch.get("source_asin") or ""),
+                        )
                     web_link = str(uploaded.get("webViewLink") or "").strip()
                     folder_path = str(uploaded.get("audit_folder_path") or "").strip()
                     file_id = uploaded.get("id")
                     if web_link:
-                        st.success(f"Saved to Google Drive: {web_link}")
+                        format_name = "Google Doc" if upload_doc_clicked else "Markdown"
+                        st.success(f"Saved to Google Drive ({format_name}): {web_link}")
                         if folder_path:
                             st.caption(f"Folder: `{folder_path}`")
                     else:
