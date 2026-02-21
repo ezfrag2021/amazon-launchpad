@@ -607,6 +607,10 @@ LAUNCHPAD_DB_DSN=postgresql://launchpad_app:<PASSWORD>@192.168.0.110:5433/amazon
 MARKET_INTEL_DSN=postgresql://market_intel_writer:<PASSWORD>@192.168.0.110:5433/amazon_dash?sslmode=disable
 PG_DSN=postgresql://amazon_dash_user:<PASSWORD>@192.168.0.110:5433/amazon_dash?sslmode=disable
 
+# Permission note: amazon_dash_user is the elevated DB account for this project.
+# Use PG_DSN (amazon_dash_user) for migrations/DDL and permission-sensitive operations.
+# launchpad_app remains the standard runtime app role for everyday Launchpad reads/writes.
+
 # ===== Jungle Scout =====
 JUNGLESCOUT_API_KEY_NAME=<YOUR_KEY_NAME>
 JUNGLESCOUT_API_KEY=<YOUR_API_KEY>

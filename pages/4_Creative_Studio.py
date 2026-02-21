@@ -24,6 +24,11 @@ from psycopg.rows import dict_row
 from services.auth_manager import get_generative_client
 from services.db_connection import connect, resolve_dsn
 from services.launch_state import LaunchStateManager
+from services.workflow_ui import (
+    record_section_save,
+    render_readiness_panel,
+    render_section_save_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Stage 4: Creative Studio",
+    page_title="Module 4: Creative Studio",
     page_icon="🎨",
     layout="wide",
 )
@@ -44,13 +49,48 @@ TARGET_MARKETPLACES = ["UK", "DE", "FR", "IT", "ES"]
 BRAND_VOICES = ["Professional", "Friendly", "Technical", "Luxury"]
 
 IMAGE_SLOTS: dict[int, dict[str, str]] = {
-    1: {"name": "Main Image", "type": "main_white_bg", "desc": "White background, product only", "icon": "🖼️"},
-    2: {"name": "Lifestyle", "type": "lifestyle", "desc": "Product in use / lifestyle context", "icon": "🌟"},
-    3: {"name": "Infographic", "type": "infographic", "desc": "Features & benefits callouts", "icon": "📊"},
-    4: {"name": "Comparison", "type": "comparison", "desc": "vs. competitors / before-after", "icon": "⚖️"},
-    5: {"name": "Dimensions", "type": "dimensions", "desc": "Size reference / measurements", "icon": "📐"},
-    6: {"name": "Packaging", "type": "packaging", "desc": "What's in the box", "icon": "📦"},
-    7: {"name": "In-Use", "type": "in_use", "desc": "Hands using the product", "icon": "🤲"},
+    1: {
+        "name": "Main Image",
+        "type": "main_white_bg",
+        "desc": "White background, product only",
+        "icon": "🖼️",
+    },
+    2: {
+        "name": "Lifestyle",
+        "type": "lifestyle",
+        "desc": "Product in use / lifestyle context",
+        "icon": "🌟",
+    },
+    3: {
+        "name": "Infographic",
+        "type": "infographic",
+        "desc": "Features & benefits callouts",
+        "icon": "📊",
+    },
+    4: {
+        "name": "Comparison",
+        "type": "comparison",
+        "desc": "vs. competitors / before-after",
+        "icon": "⚖️",
+    },
+    5: {
+        "name": "Dimensions",
+        "type": "dimensions",
+        "desc": "Size reference / measurements",
+        "icon": "📐",
+    },
+    6: {
+        "name": "Packaging",
+        "type": "packaging",
+        "desc": "What's in the box",
+        "icon": "📦",
+    },
+    7: {
+        "name": "In-Use",
+        "type": "in_use",
+        "desc": "Hands using the product",
+        "icon": "🤲",
+    },
 }
 
 AMAZON_LIMITS = {
@@ -65,6 +105,7 @@ IMAGEN_MODEL = "imagen-3.0-generate-001"
 
 # Load environment variables
 load_dotenv()
+
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -114,7 +155,7 @@ def _init_session_state() -> None:
 # Header
 # ---------------------------------------------------------------------------
 def _render_header() -> None:
-    st.title("🎨 Stage 4: Creative Studio")
+    st.title("🎨 Module 4: Creative Studio")
     st.markdown(
         "Generate AI-optimized listings and product images. "
         "Use **Google Gemini** for listing copy and **Imagen 3** for product visuals."
@@ -149,20 +190,18 @@ def _render_launch_selector() -> dict[str, Any] | None:
             st.warning("No launches found. Complete Stage 1 first.")
             return None
 
-        # Filter to launches at Stage 3+ (pricing complete)
-        eligible = [l for l in launches if int(l.get("current_stage", 1)) >= 3]
-        if not eligible:
-            st.warning("⚠️ No launches have completed Stage 3 (Risk & Pricing). Complete Stage 3 first.")
-            return None
-
         options = {
-            f"#{l['launch_id']} — {l['source_asin']} (Stage {l['current_stage']}, {l.get('pursuit_category') or 'unscored'})": l["launch_id"]
-            for l in eligible
+            f"#{l['launch_id']} — {l['source_asin']} (Stage {l['current_stage']}, {l.get('pursuit_category') or 'unscored'})": l[
+                "launch_id"
+            ]
+            for l in launches
         }
-        choice = st.selectbox("Select launch", list(options.keys()), key="cs_launch_selector")
+        choice = st.selectbox(
+            "Select launch", list(options.keys()), key="cs_launch_selector"
+        )
         launch_id = options[choice]
         st.session_state["cs_selected_launch_id"] = launch_id
-        return next((l for l in eligible if l["launch_id"] == launch_id), None)
+        return next((l for l in launches if l["launch_id"] == launch_id), None)
 
     with col_refresh:
         if st.button("🔄 Refresh", use_container_width=True):
@@ -232,7 +271,9 @@ def _render_launch_info(launch: dict[str, Any]) -> None:
                     )
                     kw_rows = cur.fetchall()
             if kw_rows and not st.session_state.get("cs_target_keywords"):
-                st.session_state["cs_target_keywords"] = ", ".join(r[0] for r in kw_rows)
+                st.session_state["cs_target_keywords"] = ", ".join(
+                    r[0] for r in kw_rows
+                )
 
         except Exception as exc:
             logger.warning("Could not load pricing/PPC data: %s", exc)
@@ -241,16 +282,14 @@ def _render_launch_info(launch: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # Stage 3 validation
 # ---------------------------------------------------------------------------
-def _validate_stage3(launch: dict[str, Any]) -> bool:
-    """Check that Stage 3 (pricing) is complete."""
+def _show_stage_readiness_notice(launch: dict[str, Any]) -> None:
+    """Show non-blocking readiness notice for Stage 4 inputs."""
     stage = int(launch.get("current_stage", 1))
     if stage < 3:
-        st.error(
-            "❌ Stage 3 (Risk & Pricing Architect) must be completed before using Creative Studio. "
-            "Please complete Stage 3 first."
+        st.warning(
+            "⚠️ Module 3 pricing is not marked complete for this launch yet. "
+            "You can still draft listings and creative assets now; save and finalize when ready."
         )
-        return False
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +297,8 @@ def _validate_stage3(launch: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 def _render_listing_inputs(launch: dict[str, Any]) -> None:
     st.subheader("✍️ Listing Generation")
-    launch_description = (launch.get("product_description") or "")
+    render_section_save_status(int(launch["launch_id"]), "creative", "listing_draft")
+    launch_description = launch.get("product_description") or ""
 
     col1, col2 = st.columns(2)
 
@@ -268,7 +308,7 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
             value=st.session_state.get("cs_product_name") or launch_description[:100],
             placeholder="e.g. Premium Stainless Steel Water Bottle 32oz",
             key="cs_product_name_input",
-            help="Auto-populated from Stage 1 product description.",
+            help="Auto-populated from Module 1 product description.",
         )
         st.session_state["cs_product_name"] = product_name
 
@@ -296,7 +336,9 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
         brand_voice = st.selectbox(
             "Brand Voice",
             BRAND_VOICES,
-            index=BRAND_VOICES.index(st.session_state.get("cs_brand_voice", "Professional")),
+            index=BRAND_VOICES.index(
+                st.session_state.get("cs_brand_voice", "Professional")
+            ),
             key="cs_brand_voice_input",
         )
         st.session_state["cs_brand_voice"] = brand_voice
@@ -380,7 +422,7 @@ OUTPUT FORMAT (respond with valid JSON only, no markdown):
   "quality_score": 85,
   "quality_notes": ["Note 1", "Note 2"],
   "optimization_suggestions": ["Suggestion 1", "Suggestion 2"]
-  {', "a_plus_content": {{...}}' if include_aplus else ''}
+  {', "a_plus_content": {{...}}' if include_aplus else ""}
 }}
 
 RULES:
@@ -408,8 +450,13 @@ def _generate_listing(
         model = genai.GenerativeModel(GEMINI_MODEL)
 
         prompt = _build_listing_prompt(
-            product_name, key_features, target_keywords,
-            brand_voice, include_aplus, rufus_optimize, marketplace
+            product_name,
+            key_features,
+            target_keywords,
+            brand_voice,
+            include_aplus,
+            rufus_optimize,
+            marketplace,
         )
 
         response = model.generate_content(prompt)
@@ -500,7 +547,13 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
     st.markdown("**Listing Quality Score:**")
     col_q1, col_q2 = st.columns([1, 3])
     with col_q1:
-        q_color = "#27ae60" if quality_score >= 80 else "#f39c12" if quality_score >= 60 else "#e74c3c"
+        q_color = (
+            "#27ae60"
+            if quality_score >= 80
+            else "#f39c12"
+            if quality_score >= 60
+            else "#e74c3c"
+        )
         st.markdown(
             f"<div style='text-align:center; padding:12px; border-radius:8px; "
             f"background:{q_color}; color:white; font-size:1.5em; font-weight:bold;'>"
@@ -658,7 +711,9 @@ def _build_image_prompt(
             "Natural lighting, lifestyle feel. Shows ease of use."
         ),
     }
-    return slot_prompts.get(slot["type"], f"Professional product image of {product_name}.")
+    return slot_prompts.get(
+        slot["type"], f"Professional product image of {product_name}."
+    )
 
 
 def _generate_image_with_imagen(prompt: str) -> bytes | None:
@@ -730,7 +785,14 @@ def _save_image_to_gallery(
                         model_used   = EXCLUDED.model_used,
                         generated_at = now()
                     """,
-                    (launch_id, slot_number, image_type, prompt_used, storage_path, model_used),
+                    (
+                        launch_id,
+                        slot_number,
+                        image_type,
+                        prompt_used,
+                        storage_path,
+                        model_used,
+                    ),
                 )
             conn.commit()
             return True
@@ -766,8 +828,10 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
     st.caption("Amazon requires 7 images for optimal listing performance.")
 
     launch_id = launch["launch_id"]
-    launch_description = (launch.get("product_description") or "")
-    product_name = st.session_state.get("cs_product_name") or launch_description or "Product"
+    launch_description = launch.get("product_description") or ""
+    product_name = (
+        st.session_state.get("cs_product_name") or launch_description or "Product"
+    )
     product_desc = launch_description
 
     # Load existing gallery from DB
@@ -784,12 +848,20 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
     slot_items = list(IMAGE_SLOTS.items())
     for row_start in range(0, len(slot_items), 2):
         cols = st.columns(2)
-        for col_idx, (slot_num, slot_info) in enumerate(slot_items[row_start:row_start + 2]):
+        for col_idx, (slot_num, slot_info) in enumerate(
+            slot_items[row_start : row_start + 2]
+        ):
             with cols[col_idx]:
-                _render_image_slot(launch_id, slot_num, slot_info, product_name, product_desc, gallery)
+                _render_image_slot(
+                    launch_id, slot_num, slot_info, product_name, product_desc, gallery
+                )
 
     # Summary
-    filled_slots = sum(1 for s in range(1, 8) if s in gallery and gallery[s].get("image_bytes") or s in db_gallery)
+    filled_slots = sum(
+        1
+        for s in range(1, 8)
+        if s in gallery and gallery[s].get("image_bytes") or s in db_gallery
+    )
     st.markdown(f"**Gallery Progress:** {filled_slots} / 7 slots filled")
     if filled_slots < 7:
         st.progress(filled_slots / 7.0, text=f"{filled_slots}/7 images ready")
@@ -810,7 +882,9 @@ def _render_image_slot(
     status_icon = "✅" if has_image else "⬜"
 
     with st.container(border=True):
-        st.markdown(f"**{status_icon} Slot {slot_num}: {slot_info['icon']} {slot_info['name']}**")
+        st.markdown(
+            f"**{status_icon} Slot {slot_num}: {slot_info['icon']} {slot_info['name']}**"
+        )
         st.caption(slot_info["desc"])
 
         # Show image if available
@@ -850,13 +924,19 @@ def _render_image_slot(
                     }
                     st.session_state["cs_image_gallery"] = gallery
                     _save_image_to_gallery(
-                        launch_id, slot_num, slot_info["type"],
-                        prompt, img_bytes, IMAGEN_MODEL
+                        launch_id,
+                        slot_num,
+                        slot_info["type"],
+                        prompt,
+                        img_bytes,
+                        IMAGEN_MODEL,
                     )
                     st.success(f"✅ {slot_info['name']} generated!")
                     st.rerun()
                 else:
-                    st.warning("⚠️ Image generation returned no result. Check credentials.")
+                    st.warning(
+                        "⚠️ Image generation returned no result. Check credentials."
+                    )
 
         with btn_col2:
             uploaded = st.file_uploader(
@@ -876,8 +956,12 @@ def _render_image_slot(
                 }
                 st.session_state["cs_image_gallery"] = gallery
                 _save_image_to_gallery(
-                    launch_id, slot_num, slot_info["type"],
-                    "manual_upload", img_bytes, "upload"
+                    launch_id,
+                    slot_num,
+                    slot_info["type"],
+                    "manual_upload",
+                    img_bytes,
+                    "upload",
                 )
                 st.success(f"✅ {slot_info['name']} uploaded!")
                 st.rerun()
@@ -940,7 +1024,9 @@ def _render_version_management(launch_id: int, marketplace: str) -> None:
 
     versions = _load_draft_versions(launch_id, marketplace)
     if not versions:
-        st.info("No saved drafts yet. Generate and save a listing to create version history.")
+        st.info(
+            "No saved drafts yet. Generate and save a listing to create version history."
+        )
         return
 
     st.markdown(f"**{len(versions)} saved version(s) for {marketplace}:**")
@@ -1004,9 +1090,16 @@ def _render_version_management(launch_id: int, marketplace: str) -> None:
         col_c1, col_c2 = st.columns(2)
         v_options = {f"v{v['version']}": v for v in versions}
         with col_c1:
-            v1_key = st.selectbox("Version A", list(v_options.keys()), key="cs_compare_v1_sel")
+            v1_key = st.selectbox(
+                "Version A", list(v_options.keys()), key="cs_compare_v1_sel"
+            )
         with col_c2:
-            v2_key = st.selectbox("Version B", list(v_options.keys()), index=min(1, len(v_options) - 1), key="cs_compare_v2_sel")
+            v2_key = st.selectbox(
+                "Version B",
+                list(v_options.keys()),
+                index=min(1, len(v_options) - 1),
+                key="cs_compare_v2_sel",
+            )
 
         if st.button("🔍 Compare Side-by-Side"):
             v1 = v_options[v1_key]
@@ -1044,7 +1137,9 @@ def _render_marketplace_tabs(launch: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Final review & export
 # ---------------------------------------------------------------------------
-def _render_final_review(launch: dict[str, Any], listing: dict[str, Any] | None) -> None:
+def _render_final_review(
+    launch: dict[str, Any], listing: dict[str, Any] | None
+) -> None:
     st.subheader("🔍 Final Review & Export")
 
     launch_id = launch["launch_id"]
@@ -1052,17 +1147,25 @@ def _render_final_review(launch: dict[str, Any], listing: dict[str, Any] | None)
     db_gallery = _load_image_gallery(launch_id)
 
     filled_slots = sum(
-        1 for s in range(1, 8)
+        1
+        for s in range(1, 8)
         if (s in gallery and gallery[s].get("image_bytes")) or s in db_gallery
     )
 
     # Validation checklist
     st.markdown("**Launch Readiness Checklist:**")
     checks = {
-        "✅ Listing generated" if listing else "❌ Listing not generated": bool(listing),
-        f"{'✅' if filled_slots == 7 else '⚠️'} Images: {filled_slots}/7 slots filled": filled_slots == 7,
-        "✅ Title within 200 chars" if listing and len(listing.get("title", "")) <= 200 else "❌ Title too long": listing and len(listing.get("title", "")) <= 200,
-        "✅ All 5 bullets present" if listing and len(listing.get("bullets", [])) >= 5 else "❌ Missing bullets": listing and len(listing.get("bullets", [])) >= 5,
+        "✅ Listing generated" if listing else "❌ Listing not generated": bool(
+            listing
+        ),
+        f"{'✅' if filled_slots == 7 else '⚠️'} Images: {filled_slots}/7 slots filled": filled_slots
+        == 7,
+        "✅ Title within 200 chars"
+        if listing and len(listing.get("title", "")) <= 200
+        else "❌ Title too long": listing and len(listing.get("title", "")) <= 200,
+        "✅ All 5 bullets present"
+        if listing and len(listing.get("bullets", [])) >= 5
+        else "❌ Missing bullets": listing and len(listing.get("bullets", [])) >= 5,
     }
 
     for label, passed in checks.items():
@@ -1090,12 +1193,16 @@ def _render_final_review(launch: dict[str, Any], listing: dict[str, Any] | None)
                     advanced = mgr.advance_stage(conn, launch_id, validate=False)
                     if advanced:
                         conn.commit()
-                        st.success("🎉 Launch finalized! Status: **Launch Ready** (Stage 5)")
+                        st.success(
+                            "🎉 Launch finalized! Status: **Launch Ready** (Stage 5)"
+                        )
                         st.balloons()
                         _load_launches()
                         st.rerun()
                     else:
-                        st.warning("⚠️ Could not advance stage. Launch may already be complete.")
+                        st.warning(
+                            "⚠️ Could not advance stage. Launch may already be complete."
+                        )
             except Exception as exc:
                 st.error(f"❌ Failed to finalize launch: {exc}")
 
@@ -1127,7 +1234,9 @@ def _render_final_review(launch: dict[str, Any], listing: dict[str, Any] | None)
             for slot_num, data in gallery.items()
             if data.get("image_bytes")
         }
-        if gallery_images and st.button("🖼️ Download Images ZIP", use_container_width=True):
+        if gallery_images and st.button(
+            "🖼️ Download Images ZIP", use_container_width=True
+        ):
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for slot_num, img_bytes in gallery_images.items():
@@ -1185,9 +1294,14 @@ def main() -> None:
     if selected_launch is None:
         st.stop()
 
-    # --- Validate Stage 3 complete ---
-    if not _validate_stage3(selected_launch):
-        st.stop()
+    try:
+        with _open_conn() as conn:
+            render_readiness_panel(conn, int(selected_launch["launch_id"]), "Creative")
+    except Exception:
+        pass
+
+    # --- Non-blocking stage readiness notice ---
+    _show_stage_readiness_notice(selected_launch)
 
     _render_launch_info(selected_launch)
     st.divider()
@@ -1212,7 +1326,9 @@ def main() -> None:
         st.divider()
         gen_col, _ = st.columns([1, 3])
         with gen_col:
-            if st.button("⚡ Generate Listing", type="primary", use_container_width=True):
+            if st.button(
+                "⚡ Generate Listing", type="primary", use_container_width=True
+            ):
                 product_name = st.session_state.get("cs_product_name", "")
                 if not product_name:
                     st.error("❌ Please enter a Product Name.")
@@ -1221,10 +1337,18 @@ def main() -> None:
                         listing = _generate_listing(
                             product_name=product_name,
                             key_features=st.session_state.get("cs_key_features", ""),
-                            target_keywords=st.session_state.get("cs_target_keywords", ""),
-                            brand_voice=st.session_state.get("cs_brand_voice", "Professional"),
-                            include_aplus=st.session_state.get("cs_include_aplus", False),
-                            rufus_optimize=st.session_state.get("cs_rufus_optimize", False),
+                            target_keywords=st.session_state.get(
+                                "cs_target_keywords", ""
+                            ),
+                            brand_voice=st.session_state.get(
+                                "cs_brand_voice", "Professional"
+                            ),
+                            include_aplus=st.session_state.get(
+                                "cs_include_aplus", False
+                            ),
+                            rufus_optimize=st.session_state.get(
+                                "cs_rufus_optimize", False
+                            ),
                             marketplace=active_marketplace,
                         )
                     if listing:
@@ -1248,9 +1372,12 @@ def main() -> None:
                         launch_id=launch_id,
                         marketplace=active_marketplace,
                         listing=edited,
-                        rufus_optimized=st.session_state.get("cs_rufus_optimize", False),
+                        rufus_optimized=st.session_state.get(
+                            "cs_rufus_optimize", False
+                        ),
                     )
                     if success:
+                        record_section_save(launch_id, "creative", "listing_draft")
                         st.success("✅ Draft saved!")
                         st.rerun()
 
@@ -1265,7 +1392,11 @@ def main() -> None:
 
             mp_gen_col, _ = st.columns([1, 3])
             with mp_gen_col:
-                if st.button(f"⚡ Generate {mp} Listing", key=f"cs_gen_{mp}", use_container_width=True):
+                if st.button(
+                    f"⚡ Generate {mp} Listing",
+                    key=f"cs_gen_{mp}",
+                    use_container_width=True,
+                ):
                     product_name = st.session_state.get("cs_product_name", "")
                     if not product_name:
                         st.error("❌ Set Product Name in the UK tab first.")
@@ -1273,11 +1404,21 @@ def main() -> None:
                         with st.spinner(f"🤖 Generating {mp} listing..."):
                             mp_listing = _generate_listing(
                                 product_name=product_name,
-                                key_features=st.session_state.get("cs_key_features", ""),
-                                target_keywords=st.session_state.get("cs_target_keywords", ""),
-                                brand_voice=st.session_state.get("cs_brand_voice", "Professional"),
-                                include_aplus=st.session_state.get("cs_include_aplus", False),
-                                rufus_optimize=st.session_state.get("cs_rufus_optimize", False),
+                                key_features=st.session_state.get(
+                                    "cs_key_features", ""
+                                ),
+                                target_keywords=st.session_state.get(
+                                    "cs_target_keywords", ""
+                                ),
+                                brand_voice=st.session_state.get(
+                                    "cs_brand_voice", "Professional"
+                                ),
+                                include_aplus=st.session_state.get(
+                                    "cs_include_aplus", False
+                                ),
+                                rufus_optimize=st.session_state.get(
+                                    "cs_rufus_optimize", False
+                                ),
                                 marketplace=mp,
                             )
                         if mp_listing:
@@ -1290,14 +1431,21 @@ def main() -> None:
                 edited_mp = _render_listing_display(mp_listing)
                 save_mp_col, _ = st.columns([1, 3])
                 with save_mp_col:
-                    if st.button(f"💾 Save {mp} Draft", key=f"cs_save_{mp}", use_container_width=True):
+                    if st.button(
+                        f"💾 Save {mp} Draft",
+                        key=f"cs_save_{mp}",
+                        use_container_width=True,
+                    ):
                         success = _save_listing_draft(
                             launch_id=launch_id,
                             marketplace=mp,
                             listing=edited_mp,
-                            rufus_optimized=st.session_state.get("cs_rufus_optimize", False),
+                            rufus_optimized=st.session_state.get(
+                                "cs_rufus_optimize", False
+                            ),
                         )
                         if success:
+                            record_section_save(launch_id, "creative", "listing_draft")
                             st.success(f"✅ {mp} draft saved!")
 
     st.divider()
@@ -1313,7 +1461,9 @@ def main() -> None:
     st.divider()
 
     # --- Final review ---
-    current_listing = st.session_state.get("cs_edited_listing") or st.session_state.get("cs_generated_listing")
+    current_listing = st.session_state.get("cs_edited_listing") or st.session_state.get(
+        "cs_generated_listing"
+    )
     _render_final_review(selected_launch, current_listing)
 
 

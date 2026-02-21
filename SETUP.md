@@ -116,18 +116,27 @@ source venv/bin/activate
 psql -U launchpad_app -d amazon_dash -f scripts/validate_launchpad_access.sql
 ```
 
-### Step 5: Restart Streamlit
+### Step 5: Manage Streamlit Service (Persistent)
 
-After completing all steps above:
+Use the Launchpad systemd service (runs on port 8503 and survives reboots):
+
+Do not stop or modify services on ports 8501/8502; those are owned by BI/MI systems.
 
 ```bash
-# Stop current Streamlit
-pkill -f "streamlit run app.py"
+# Check service status
+sudo systemctl status streamlit-launchpad.service --no-pager
 
-# Start with virtual environment
-cd /mnt/amazon-launch
-source venv/bin/activate
-streamlit run app.py
+# Restart service after config/code changes
+sudo systemctl restart streamlit-launchpad.service
+
+# Follow live logs
+sudo journalctl -u streamlit-launchpad.service -f
+```
+
+Enable on boot (one-time):
+
+```bash
+sudo systemctl enable streamlit-launchpad.service
 ```
 
 ---
@@ -167,8 +176,8 @@ streamlit run app.py
 # Check what's using the port
 lsof -i :8503
 
-# Kill existing process
-pkill -f "streamlit run app.py"
+# Restart Launchpad service cleanly
+sudo systemctl restart streamlit-launchpad.service
 ```
 
 ---

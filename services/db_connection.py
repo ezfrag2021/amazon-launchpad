@@ -8,12 +8,41 @@ role injection, and a psycopg connection helper.
 from __future__ import annotations
 
 import os
+import re
 from urllib.parse import urlparse, quote_plus, urlunparse
 
 import psycopg
 
 # Default role used for all launchpad DB connections
 DEFAULT_ROLE = "launchpad_app"
+
+_ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env_refs(value: str) -> str:
+    """Expand ${VAR} placeholders using current environment variables."""
+    expanded = value
+
+    for _ in range(3):
+        refs = _ENV_REF_PATTERN.findall(expanded)
+        if not refs:
+            break
+
+        missing = [var for var in refs if os.getenv(var) is None]
+        if missing:
+            names = ", ".join(sorted(set(missing)))
+            raise RuntimeError(
+                f"Missing environment variables referenced in DSN: {names}"
+            )
+
+        expanded = _ENV_REF_PATTERN.sub(lambda m: os.getenv(m.group(1), ""), expanded)
+
+    unresolved = _ENV_REF_PATTERN.findall(expanded)
+    if unresolved:
+        names = ", ".join(sorted(set(unresolved)))
+        raise RuntimeError(f"Could not fully resolve DSN placeholders: {names}")
+
+    return expanded
 
 
 def resolve_dsn(primary_var: str, *fallback_vars: str) -> str:
@@ -39,7 +68,7 @@ def resolve_dsn(primary_var: str, *fallback_vars: str) -> str:
     for var in (primary_var, *fallback_vars):
         value = os.getenv(var)
         if value:
-            return value
+            return _expand_env_refs(value)
 
     checked = ", ".join((primary_var, *fallback_vars))
     raise RuntimeError(

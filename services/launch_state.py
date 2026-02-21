@@ -16,17 +16,18 @@ from __future__ import annotations
 from typing import Any
 
 import psycopg
+from psycopg import errors
 from psycopg.rows import dict_row
 
 
 # ---------------------------------------------------------------------------
 # Stage constants
 # ---------------------------------------------------------------------------
-STAGE_OPPORTUNITY: int = 1   # Opportunity Validator
-STAGE_COMPLIANCE: int = 2    # Compliance Compass
-STAGE_PRICING: int = 3       # Risk & Pricing Architect
-STAGE_CREATIVE: int = 4      # Creative Studio
-STAGE_COMPLETE: int = 5      # Launch ready
+STAGE_OPPORTUNITY: int = 1  # Opportunity Validator
+STAGE_COMPLIANCE: int = 2  # Compliance Compass
+STAGE_PRICING: int = 3  # Risk & Pricing Architect
+STAGE_CREATIVE: int = 4  # Creative Studio
+STAGE_COMPLETE: int = 5  # Launch ready
 
 # ---------------------------------------------------------------------------
 # Pursuit category constants
@@ -79,6 +80,7 @@ class LaunchStateManager:
         source_asin: str,
         source_marketplace: str = "US",
         target_marketplaces: list[str] | None = None,
+        launch_name: str | None = None,
         product_description: str | None = None,
         product_category: str | None = None,
     ) -> int:
@@ -99,6 +101,8 @@ class LaunchStateManager:
             Optional free-text product description.
         product_category : str | None
             Optional product category string.
+        launch_name : str | None
+            Optional human-friendly launch label.
 
         Returns
         -------
@@ -112,20 +116,23 @@ class LaunchStateManager:
             cur.execute(
                 """
                 INSERT INTO launchpad.product_launches
-                    (source_asin, source_marketplace, target_marketplaces,
+                    (source_asin, source_marketplace, target_marketplaces, launch_name,
                      product_description, product_category)
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING launch_id
                 """,
                 (
                     source_asin,
                     source_marketplace,
                     target_marketplaces,
+                    launch_name,
                     product_description,
                     product_category,
                 ),
             )
             row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to create launch; no launch_id returned.")
             return int(row[0])
 
     # ------------------------------------------------------------------
@@ -153,18 +160,40 @@ class LaunchStateManager:
             All columns as a dict, or None if not found.
         """
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                """
-                SELECT launch_id, source_asin, source_marketplace,
-                       target_marketplaces, product_description, product_category,
-                       pursuit_score, pursuit_category, current_stage,
-                       created_at, updated_at
-                FROM launchpad.product_launches
-                WHERE launch_id = %s
-                """,
-                (launch_id,),
-            )
-            return cur.fetchone()
+            try:
+                cur.execute(
+                    """
+                    SELECT launch_id, source_asin, source_marketplace,
+                           target_marketplaces, launch_name, is_archived, archived_at,
+                           product_description, product_category,
+                           pursuit_score, pursuit_category, current_stage,
+                           created_at, updated_at
+                    FROM launchpad.product_launches
+                    WHERE launch_id = %s
+                    """,
+                    (launch_id,),
+                )
+                return cur.fetchone()
+            except errors.UndefinedColumn:
+                conn.rollback()
+                cur.execute(
+                    """
+                    SELECT launch_id, source_asin, source_marketplace,
+                           target_marketplaces,
+                           product_description, product_category,
+                           pursuit_score, pursuit_category, current_stage,
+                           created_at, updated_at
+                    FROM launchpad.product_launches
+                    WHERE launch_id = %s
+                    """,
+                    (launch_id,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    row["launch_name"] = None
+                    row["is_archived"] = False
+                    row["archived_at"] = None
+                return row
 
     # ------------------------------------------------------------------
     # Update
@@ -180,7 +209,7 @@ class LaunchStateManager:
         Update arbitrary fields on a product_launches row.
 
         Allowed fields: pursuit_score, pursuit_category, current_stage,
-        product_description, product_category, source_asin,
+        product_description, product_category, source_asin, launch_name,
         source_marketplace, target_marketplaces.
 
         Parameters
@@ -211,6 +240,9 @@ class LaunchStateManager:
             "source_asin",
             "source_marketplace",
             "target_marketplaces",
+            "launch_name",
+            "is_archived",
+            "archived_at",
         }
 
         if not fields:
@@ -347,7 +379,9 @@ class LaunchStateManager:
         blockers: list[str] = []
 
         if current >= STAGE_COMPLETE:
-            blockers.append("Launch is already complete; no further stages to advance to.")
+            blockers.append(
+                "Launch is already complete; no further stages to advance to."
+            )
             return False, blockers
 
         if current == STAGE_OPPORTUNITY:
@@ -517,6 +551,9 @@ class LaunchStateManager:
             "source_asin": launch["source_asin"],
             "source_marketplace": launch["source_marketplace"],
             "target_marketplaces": launch["target_marketplaces"],
+            "launch_name": launch.get("launch_name"),
+            "is_archived": bool(launch.get("is_archived")),
+            "archived_at": launch.get("archived_at"),
             "product_description": launch["product_description"],
             "product_category": launch["product_category"],
             "current_stage": current,
@@ -543,6 +580,8 @@ class LaunchStateManager:
         conn: psycopg.Connection,
         status: str | None = None,
         limit: int = 50,
+        include_archived: bool = False,
+        archived_only: bool = False,
     ) -> list[dict[str, Any]]:
         """
         List launches with optional filtering by pursuit_category.
@@ -556,6 +595,10 @@ class LaunchStateManager:
             Pass None to return all launches.
         limit : int
             Maximum number of rows to return (default 50).
+        include_archived : bool
+            If True, include archived launches.
+        archived_only : bool
+            If True, return only archived launches.
 
         Returns
         -------
@@ -563,31 +606,76 @@ class LaunchStateManager:
             List of launch dicts ordered by created_at DESC.
         """
         with conn.cursor(row_factory=dict_row) as cur:
-            if status is not None:
-                cur.execute(
-                    """
-                    SELECT launch_id, source_asin, source_marketplace,
-                           target_marketplaces, product_description, product_category,
-                           pursuit_score, pursuit_category, current_stage,
-                           created_at, updated_at
-                    FROM launchpad.product_launches
-                    WHERE pursuit_category = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (status, limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT launch_id, source_asin, source_marketplace,
-                           target_marketplaces, product_description, product_category,
-                           pursuit_score, pursuit_category, current_stage,
-                           created_at, updated_at
-                    FROM launchpad.product_launches
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
-            return list(cur.fetchall())
+            include_archived_effective = include_archived or archived_only
+            try:
+                if status is None:
+                    cur.execute(
+                        """
+                        SELECT launch_id, source_asin, source_marketplace, launch_name,
+                               is_archived, archived_at,
+                               target_marketplaces, product_description, product_category,
+                               pursuit_score, pursuit_category, current_stage,
+                               created_at, updated_at
+                        FROM launchpad.product_launches
+                        WHERE (%s OR COALESCE(is_archived, FALSE) = FALSE)
+                          AND (NOT %s OR COALESCE(is_archived, FALSE) = TRUE)
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                        """,
+                        (include_archived_effective, archived_only, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT launch_id, source_asin, source_marketplace, launch_name,
+                               is_archived, archived_at,
+                               target_marketplaces, product_description, product_category,
+                               pursuit_score, pursuit_category, current_stage,
+                               created_at, updated_at
+                        FROM launchpad.product_launches
+                        WHERE pursuit_category = %s
+                          AND (%s OR COALESCE(is_archived, FALSE) = FALSE)
+                          AND (NOT %s OR COALESCE(is_archived, FALSE) = TRUE)
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                        """,
+                        (status, include_archived_effective, archived_only, limit),
+                    )
+                return list(cur.fetchall())
+            except errors.UndefinedColumn:
+                conn.rollback()
+                if archived_only:
+                    return []
+                if status is None:
+                    cur.execute(
+                        """
+                        SELECT launch_id, source_asin, source_marketplace,
+                               target_marketplaces, product_description, product_category,
+                               pursuit_score, pursuit_category, current_stage,
+                               created_at, updated_at
+                        FROM launchpad.product_launches
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                        """,
+                        (limit,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT launch_id, source_asin, source_marketplace,
+                               target_marketplaces, product_description, product_category,
+                               pursuit_score, pursuit_category, current_stage,
+                               created_at, updated_at
+                        FROM launchpad.product_launches
+                        WHERE pursuit_category = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                        """,
+                        (status, limit),
+                    )
+                rows = list(cur.fetchall())
+                for row in rows:
+                    row["launch_name"] = None
+                    row["is_archived"] = False
+                    row["archived_at"] = None
+                return rows

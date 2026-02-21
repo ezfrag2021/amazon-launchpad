@@ -19,12 +19,17 @@ from services.db_connection import connect, resolve_dsn
 from services.js_client import JungleScoutClient
 from services.launch_state import STAGE_COMPLIANCE, STAGE_PRICING, LaunchStateManager
 from services.pricing_engine import PricingEngine
+from services.workflow_ui import (
+    record_section_save,
+    render_readiness_panel,
+    render_section_save_status,
+)
 
 # ---------------------------------------------------------------------------
 # Page configuration — must be the first Streamlit call
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Stage 3: Risk & Pricing Architect",
+    page_title="Module 3: Risk & Pricing Architect",
     page_icon="💰",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -52,7 +57,7 @@ conn = get_connection()
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-st.title("💰 Stage 3: Risk & Pricing Architect")
+st.title("💰 Module 3: Risk & Pricing Architect")
 st.markdown(
     "Determine optimal launch price and simulate PPC campaigns. "
     "Analyse competitor pricing, calculate your price envelope, simulate keyword campaigns, "
@@ -101,12 +106,17 @@ launch_ids = list(launch_options.keys())
 if default_id in launch_ids:
     default_idx = launch_ids.index(default_id)
 
-selected_launch_id = st.selectbox(
+selected_launch_raw = st.selectbox(
     "Select Launch",
     options=launch_ids,
     index=default_idx,
     format_func=lambda lid: launch_options[lid],
 )
+if selected_launch_raw is None:
+    st.error("No launch selected.")
+    st.stop()
+
+selected_launch_id = int(selected_launch_raw)
 st.session_state["selected_launch_id"] = selected_launch_id
 
 # Load selected launch
@@ -122,17 +132,22 @@ if launch is None:
     st.error("Launch not found.")
     st.stop()
 
+try:
+    render_readiness_panel(conn, int(selected_launch_id), "Risk & Pricing")
+except Exception:
+    pass
+
 current_stage = int(launch["current_stage"])
 
 # ---------------------------------------------------------------------------
-# Stage 2 completion check
+# Stage readiness advisory (non-blocking)
 # ---------------------------------------------------------------------------
 if current_stage < STAGE_COMPLIANCE:
     st.warning(
-        "⚠️ Stage 2 (Compliance Compass) must be completed before running pricing analysis. "
-        f"This launch is currently at Stage {current_stage}."
+        "⚠️ This launch is earlier than Stage 2. You can still run and save pricing work here, "
+        "but lifecycle stage advancement remains controlled by completion rules. "
+        f"Current stage: {current_stage}."
     )
-    st.stop()
 
 # ---------------------------------------------------------------------------
 # Current product info
@@ -148,7 +163,9 @@ with st.expander("📦 Product Info", expanded=False):
     if launch.get("product_category"):
         st.markdown(f"**Category:** {launch['product_category']}")
     if launch.get("target_marketplaces"):
-        st.markdown(f"**Target Marketplaces:** {', '.join(launch['target_marketplaces'])}")
+        st.markdown(
+            f"**Target Marketplaces:** {', '.join(launch['target_marketplaces'])}"
+        )
 
 st.markdown("---")
 
@@ -262,10 +279,14 @@ if fetch_competitors and js_available:
 
                 if fetched_prices:
                     competitor_prices = fetched_prices
-                    st.success(f"✅ Fetched {len(fetched_prices)} competitor prices from Jungle Scout.")
+                    st.success(
+                        f"✅ Fetched {len(fetched_prices)} competitor prices from Jungle Scout."
+                    )
                     st.session_state["fetched_competitor_prices"] = fetched_prices
                 else:
-                    st.warning("Jungle Scout returned data but no prices could be extracted.")
+                    st.warning(
+                        "Jungle Scout returned data but no prices could be extracted."
+                    )
     except Exception as exc:  # noqa: BLE001
         conn.rollback()
         st.error(f"Jungle Scout error: {exc}")
@@ -292,7 +313,9 @@ if competitor_prices:
         avg_col2.metric("Competitors Analysed", analysis["competitor_count"])
 
         stability = analysis["price_stability"]
-        stability_color = {"stable": "🟢", "moderate": "🟡", "volatile": "🔴"}.get(stability, "⚪")
+        stability_color = {"stable": "🟢", "moderate": "🟡", "volatile": "🔴"}.get(
+            stability, "⚪"
+        )
         avg_col3.metric("Price Stability", f"{stability_color} {stability.title()}")
 
         # Price distribution histogram
@@ -353,9 +376,7 @@ st.markdown("---")
 # Section 2: Price Envelope Calculation
 # ---------------------------------------------------------------------------
 st.subheader("🎯 Price Envelope Calculator")
-st.markdown(
-    "Calculate your viable price range based on costs and competitor data."
-)
+st.markdown("Calculate your viable price range based on costs and competitor data.")
 
 pe_col1, pe_col2 = st.columns(2)
 
@@ -439,7 +460,10 @@ if calc_envelope or st.session_state.get("price_envelope"):
                     help="Suggested entry price — slight undercut on median competitor.",
                 )
                 rec_margin = engine.calculate_margin(
-                    envelope["recommended_launch_price"], cogs, amazon_fee_pct, fulfillment_cost
+                    envelope["recommended_launch_price"],
+                    cogs,
+                    amazon_fee_pct,
+                    fulfillment_cost,
                 )
                 st.caption(f"Net margin: {rec_margin['net_margin_pct']:.1f}%")
 
@@ -464,16 +488,24 @@ if calc_envelope or st.session_state.get("price_envelope"):
                 mb_col1, mb_col2, mb_col3, mb_col4 = st.columns(4)
                 mb_col1.metric("Selling Price", f"£{margin_detail['price']:.2f}")
                 mb_col2.metric("COGS", f"£{margin_detail['cost_of_goods']:.2f}")
-                mb_col3.metric("Amazon Fee", f"£{margin_detail['amazon_referral_fee']:.2f}")
-                mb_col4.metric("Fulfillment", f"£{margin_detail['fulfillment_cost']:.2f}")
+                mb_col3.metric(
+                    "Amazon Fee", f"£{margin_detail['amazon_referral_fee']:.2f}"
+                )
+                mb_col4.metric(
+                    "Fulfillment", f"£{margin_detail['fulfillment_cost']:.2f}"
+                )
 
                 mb_col5, mb_col6, mb_col7, mb_col8 = st.columns(4)
                 mb_col5.metric("Total Costs", f"£{margin_detail['total_costs']:.2f}")
                 mb_col6.metric("Net Profit", f"£{margin_detail['net_profit']:.2f}")
-                mb_col7.metric("Gross Margin", f"{margin_detail['gross_margin_pct']:.1f}%")
+                mb_col7.metric(
+                    "Gross Margin", f"{margin_detail['gross_margin_pct']:.1f}%"
+                )
                 mb_col8.metric("Net Margin", f"{margin_detail['net_margin_pct']:.1f}%")
 
-                st.caption(f"Break-even price: £{margin_detail['break_even_price']:.2f}")
+                st.caption(
+                    f"Break-even price: £{margin_detail['break_even_price']:.2f}"
+                )
 
             # Price positioning chart
             try:
@@ -496,7 +528,11 @@ if calc_envelope or st.session_state.get("price_envelope"):
                     alt.Chart(price_points)
                     .mark_bar(size=40)
                     .encode(
-                        x=alt.X("label:N", title="Price Point", sort=["Floor", "Recommended", "Ceiling"]),
+                        x=alt.X(
+                            "label:N",
+                            title="Price Point",
+                            sort=["Floor", "Recommended", "Ceiling"],
+                        ),
                         y=alt.Y("price:Q", title="Price (£)"),
                         color=alt.Color("color:N", scale=None, legend=None),
                         tooltip=["label:N", alt.Tooltip("price:Q", format="£.2f")],
@@ -517,11 +553,17 @@ if calc_envelope or st.session_state.get("price_envelope"):
 
             score = viability["viability_score"]
             if score >= 80:
-                st.success(f"✅ Viability Score: **{score:.0f}/100** — Strong positioning")
+                st.success(
+                    f"✅ Viability Score: **{score:.0f}/100** — Strong positioning"
+                )
             elif score >= 50:
-                st.warning(f"⚠️ Viability Score: **{score:.0f}/100** — Acceptable, monitor closely")
+                st.warning(
+                    f"⚠️ Viability Score: **{score:.0f}/100** — Acceptable, monitor closely"
+                )
             else:
-                st.error(f"❌ Viability Score: **{score:.0f}/100** — Revisit pricing strategy")
+                st.error(
+                    f"❌ Viability Score: **{score:.0f}/100** — Revisit pricing strategy"
+                )
 
             for rec in viability["recommendations"]:
                 st.markdown(f"- {rec}")
@@ -587,7 +629,9 @@ if simulate_ppc:
         if js_available:
             try:
                 js_client = JungleScoutClient()
-                budget_ok = js_client.check_budget_available(conn, pages=len(raw_keywords))
+                budget_ok = js_client.check_budget_available(
+                    conn, pages=len(raw_keywords)
+                )
                 conn.commit()
 
                 if budget_ok:
@@ -612,8 +656,23 @@ if simulate_ppc:
                                         attrs = getattr(sov_result, "data", None)
                                         if attrs and hasattr(attrs, "attributes"):
                                             a = attrs.attributes
-                                            search_vol = int(getattr(a, "exact_suggested_bid_median", 0) or 0)
-                                            cpc_val = float(getattr(a, "exact_suggested_bid_median", 0) or 0) or None
+                                            search_vol = int(
+                                                getattr(
+                                                    a, "exact_suggested_bid_median", 0
+                                                )
+                                                or 0
+                                            )
+                                            cpc_val = (
+                                                float(
+                                                    getattr(
+                                                        a,
+                                                        "exact_suggested_bid_median",
+                                                        0,
+                                                    )
+                                                    or 0
+                                                )
+                                                or None
+                                            )
                                     except Exception:  # noqa: BLE001
                                         pass
 
@@ -636,7 +695,9 @@ if simulate_ppc:
                                     }
                                 )
                 else:
-                    st.warning("API budget insufficient for keyword enrichment — using estimates.")
+                    st.warning(
+                        "API budget insufficient for keyword enrichment — using estimates."
+                    )
                     keyword_dicts = [
                         {
                             "keyword": kw,
@@ -771,11 +832,27 @@ st.markdown(
 )
 
 _RISK_CATEGORIES = [
-    ("safety", "🛡️ Safety Risk", "Product liability, injury risk, safety certifications required."),
-    ("fragility", "📦 Fragility Risk", "Shipping damage potential, packaging requirements, breakage rate."),
+    (
+        "safety",
+        "🛡️ Safety Risk",
+        "Product liability, injury risk, safety certifications required.",
+    ),
+    (
+        "fragility",
+        "📦 Fragility Risk",
+        "Shipping damage potential, packaging requirements, breakage rate.",
+    ),
     ("IP", "⚖️ IP Risk", "Patent infringement, trademark conflicts, design rights."),
-    ("compliance", "📋 Compliance Risk", "Regulatory requirements, certifications, restricted products."),
-    ("market", "📈 Market Risk", "Demand volatility, seasonality, market saturation trends."),
+    (
+        "compliance",
+        "📋 Compliance Risk",
+        "Regulatory requirements, certifications, restricted products.",
+    ),
+    (
+        "market",
+        "📈 Market Risk",
+        "Demand volatility, seasonality, market saturation trends.",
+    ),
 ]
 
 _SEVERITY_OPTIONS = ["Low", "Medium", "High", "Critical"]
@@ -830,7 +907,9 @@ for risk_key, risk_label, risk_hint in _RISK_CATEGORIES:
 
 # Overall risk rating
 severity_weights = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
-total_weight = sum(severity_weights.get(r["severity"], 1) for r in risk_assessments.values())
+total_weight = sum(
+    severity_weights.get(r["severity"], 1) for r in risk_assessments.values()
+)
 avg_weight = total_weight / len(risk_assessments) if risk_assessments else 1
 
 if avg_weight <= 1.5:
@@ -858,12 +937,15 @@ st.markdown("---")
 # ---------------------------------------------------------------------------
 # Section 5: Save and Complete
 # ---------------------------------------------------------------------------
-st.subheader("💾 Save & Complete Stage 3")
+st.subheader("💾 Save & Complete Module 3")
+render_section_save_status(int(selected_launch_id), "pricing", "analysis")
 
 save_col1, save_col2 = st.columns(2)
 
 with save_col1:
-    save_analysis = st.button("💾 Save Pricing Analysis", type="primary", use_container_width=True)
+    save_analysis = st.button(
+        "💾 Save Pricing Analysis", type="primary", use_container_width=True
+    )
 
 with save_col2:
     # Check if pricing analysis already saved
@@ -880,11 +962,13 @@ with save_col2:
         pricing_saved = False
 
     complete_stage = st.button(
-        "✅ Complete Stage 3 → Advance to Stage 4",
+        "✅ Complete Module 3 → Advance to Module 4",
         type="secondary",
         use_container_width=True,
         disabled=not pricing_saved,
-        help="Save pricing analysis first to enable stage completion." if not pricing_saved else "",
+        help="Save pricing analysis first to enable stage completion."
+        if not pricing_saved
+        else "",
     )
 
 if save_analysis:
@@ -896,7 +980,9 @@ if save_analysis:
 
     # Validate we have minimum required data
     if envelope is None:
-        errors.append("Price envelope not calculated — run 'Calculate Price Envelope' first.")
+        errors.append(
+            "Price envelope not calculated — run 'Calculate Price Envelope' first."
+        )
     if not ppc_sim:
         errors.append("PPC simulation not run — simulate a campaign first.")
 
@@ -996,6 +1082,7 @@ if save_analysis:
                         )
 
             conn.commit()
+            record_section_save(int(selected_launch_id), "pricing", "analysis")
             st.success(
                 f"✅ Pricing analysis saved for Launch #{selected_launch_id} "
                 f"({marketplace}). {len(ppc_sim)} PPC keywords saved."
@@ -1022,14 +1109,20 @@ if complete_stage:
             if advanced:
                 new_launch = lsm.get_launch(conn, selected_launch_id)
                 conn.commit()
-                new_stage = int(new_launch["current_stage"]) if new_launch else STAGE_PRICING + 1
+                new_stage = (
+                    int(new_launch["current_stage"])
+                    if new_launch
+                    else STAGE_PRICING + 1
+                )
                 st.success(
                     f"🎉 Stage 3 complete! Launch #{selected_launch_id} advanced to "
                     f"**Stage {new_stage}: Creative Studio**."
                 )
                 st.balloons()
             else:
-                st.warning("Stage could not be advanced. It may already be at Stage 4 or higher.")
+                st.warning(
+                    "Stage could not be advanced. It may already be at Stage 4 or higher."
+                )
 
     except Exception as exc:  # noqa: BLE001
         conn.rollback()
@@ -1065,7 +1158,9 @@ try:
             f"Analysed {saved_row[4].strftime('%Y-%m-%d %H:%M') if hasattr(saved_row[4], 'strftime') else saved_row[4]}"
         )
     else:
-        st.caption("No pricing analysis saved yet for this launch/marketplace combination.")
+        st.caption(
+            "No pricing analysis saved yet for this launch/marketplace combination."
+        )
 except Exception:  # noqa: BLE001
     conn.rollback()
     st.caption("Could not load saved pricing status.")

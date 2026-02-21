@@ -10,6 +10,7 @@ Serves as the home dashboard:
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
 import psycopg
 import streamlit as st
@@ -60,31 +61,15 @@ conn = get_connection()
 with st.sidebar:
     st.title("Amazon Launchpad 🚀")
     st.markdown("---")
-
-    nav_options = [
-        "🏠 Dashboard",
-        "1️⃣  Stage 1: Opportunity Validator",
-        "2️⃣  Stage 2: Compliance Compass",
-        "3️⃣  Stage 3: Risk & Pricing Architect",
-        "4️⃣  Stage 4: Creative Studio",
-    ]
-
-    selected_nav = st.radio(
-        "Navigation",
-        nav_options,
-        label_visibility="collapsed",
-    )
-
-    st.markdown("---")
     st.caption("Amazon Launchpad v0.1")
 
 # ---------------------------------------------------------------------------
 # Helper: colour-coded pursuit category badge
 # ---------------------------------------------------------------------------
 _PURSUIT_COLORS: dict[str, str] = {
-    PURSUIT_SATURATED: "#FF4B4B",   # red
-    PURSUIT_PROVEN: "#FF9900",      # orange (brand primary)
-    PURSUIT_GOLDMINE: "#21C354",    # green
+    PURSUIT_SATURATED: "#FF4B4B",  # red
+    PURSUIT_PROVEN: "#FF9900",  # orange (brand primary)
+    PURSUIT_GOLDMINE: "#21C354",  # green
 }
 
 _STAGE_ICONS: dict[int, str] = {
@@ -115,21 +100,11 @@ def stage_badge(stage: int) -> str:
     return f"{icon} {name}"
 
 
-# ---------------------------------------------------------------------------
-# Redirect to stage pages (informational — Streamlit handles page routing)
-# ---------------------------------------------------------------------------
-if selected_nav != "🏠 Dashboard":
-    stage_map = {
-        "1️⃣  Stage 1: Opportunity Validator": "pages/1_opportunity_validator.py",
-        "2️⃣  Stage 2: Compliance Compass": "pages/2_compliance_compass.py",
-        "3️⃣  Stage 3: Risk_Pricing_Architect.py": "pages/3_risk_pricing_architect.py",
-        "4️⃣  Stage 4: Creative Studio": "pages/4_creative_studio.py",
-    }
-    st.info(
-        f"👈 Use the sidebar to navigate to **{selected_nav.split('  ', 1)[-1]}**. "
-        "Streamlit will load the corresponding page automatically."
-    )
-    st.stop()
+def launch_label(launch: dict[str, object]) -> str:
+    """Return human-friendly launch name or fallback dash."""
+    custom_name = str(launch.get("launch_name") or "").strip()
+    return custom_name if custom_name else "—"
+
 
 # ---------------------------------------------------------------------------
 # Dashboard header
@@ -137,7 +112,7 @@ if selected_nav != "🏠 Dashboard":
 st.title("🚀 Amazon Launchpad")
 st.markdown(
     "Evaluate, validate, and launch Amazon products across international marketplaces. "
-    "Track each launch through four stages: **Opportunity → Compliance → Pricing → Creative**."
+    "Work across four modules: **Opportunity → Compliance → Pricing → Creative** in any order."
 )
 
 st.markdown("---")
@@ -148,22 +123,23 @@ st.markdown("---")
 if conn is not None:
     lsm = LaunchStateManager()
     try:
-        all_launches = lsm.list_launches(conn, limit=200)
+        all_launches = lsm.list_launches(conn, limit=200, include_archived=True)
         conn.commit()
 
-        total = len(all_launches)
+        active_launches = [l for l in all_launches if not bool(l.get("is_archived"))]
+        total = len(active_launches)
         goldmine_count = sum(
-            1 for l in all_launches if l.get("pursuit_category") == PURSUIT_GOLDMINE
+            1 for l in active_launches if l.get("pursuit_category") == PURSUIT_GOLDMINE
         )
         proven_count = sum(
-            1 for l in all_launches if l.get("pursuit_category") == PURSUIT_PROVEN
+            1 for l in active_launches if l.get("pursuit_category") == PURSUIT_PROVEN
         )
         saturated_count = sum(
-            1 for l in all_launches if l.get("pursuit_category") == PURSUIT_SATURATED
+            1 for l in active_launches if l.get("pursuit_category") == PURSUIT_SATURATED
         )
 
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Launches", total)
+        col1.metric("Active Launches", total)
         col2.metric("🟢 Goldmine", goldmine_count, help="High-opportunity products")
         col3.metric("🟠 Proven", proven_count, help="Moderate-opportunity products")
         col4.metric("🔴 Saturated", saturated_count, help="Low-opportunity products")
@@ -181,10 +157,12 @@ st.markdown("---")
 # Create New Launch
 # ---------------------------------------------------------------------------
 col_header, col_btn = st.columns([6, 2])
-col_header.subheader("Active Launches")
+col_header.subheader("Launches")
 
 with col_btn:
-    create_new = st.button("➕ Create New Launch", use_container_width=True, type="primary")
+    create_new = st.button(
+        "➕ Create New Launch", use_container_width=True, type="primary"
+    )
 
 if create_new:
     st.session_state["show_create_form"] = True
@@ -212,7 +190,18 @@ if st.session_state.get("show_create_form"):
             with form_col2:
                 target_marketplaces = st.multiselect(
                     "Target Marketplaces",
-                    options=["UK", "DE", "FR", "IT", "ES", "CA", "AU", "JP", "MX", "IN"],
+                    options=[
+                        "UK",
+                        "DE",
+                        "FR",
+                        "IT",
+                        "ES",
+                        "CA",
+                        "AU",
+                        "JP",
+                        "MX",
+                        "IN",
+                    ],
                     default=["UK", "DE", "FR", "IT", "ES"],
                     help="Select the marketplaces you want to expand into.",
                 )
@@ -225,6 +214,11 @@ if st.session_state.get("show_create_form"):
             product_category = st.text_input(
                 "Product Category (optional)",
                 placeholder="e.g. Kitchen & Dining",
+            )
+            launch_name = st.text_input(
+                "Launch Name (optional)",
+                placeholder="e.g. Q2 Kitchen Expansion",
+                help="Friendly name shown in the dashboard.",
             )
 
             submitted = st.form_submit_button("🚀 Create Launch", type="primary")
@@ -241,12 +235,16 @@ if st.session_state.get("show_create_form"):
                             conn,
                             source_asin=source_asin.strip().upper(),
                             source_marketplace="US",
-                            target_marketplaces=target_marketplaces or ["UK", "DE", "FR", "IT", "ES"],
+                            target_marketplaces=target_marketplaces
+                            or ["UK", "DE", "FR", "IT", "ES"],
+                            launch_name=launch_name.strip() or None,
                             product_description=product_description.strip() or None,
                             product_category=product_category.strip() or None,
                         )
                         conn.commit()
-                        st.success(f"✅ Launch **#{launch_id}** created for ASIN `{source_asin.strip().upper()}`!")
+                        st.success(
+                            f"✅ Launch **#{launch_id}** created for ASIN `{source_asin.strip().upper()}`!"
+                        )
                         st.session_state["show_create_form"] = False
                         st.session_state["selected_launch_id"] = launch_id
                         st.rerun()
@@ -265,6 +263,12 @@ else:
     else:
         # Filter controls
         filter_col1, filter_col2 = st.columns([3, 1])
+        with filter_col1:
+            archive_filter = st.selectbox(
+                "Filter by status",
+                ["Active", "Archived", "All"],
+                index=0,
+            )
         with filter_col2:
             filter_category = st.selectbox(
                 "Filter by category",
@@ -273,8 +277,15 @@ else:
             )
 
         filtered = all_launches
+        if archive_filter == "Active":
+            filtered = [l for l in filtered if not bool(l.get("is_archived"))]
+        elif archive_filter == "Archived":
+            filtered = [l for l in filtered if bool(l.get("is_archived"))]
+
         if filter_category != "All":
-            filtered = [l for l in all_launches if l.get("pursuit_category") == filter_category]
+            filtered = [
+                l for l in filtered if l.get("pursuit_category") == filter_category
+            ]
 
         # Build display rows
         rows_html = ""
@@ -282,9 +293,15 @@ else:
             lid = launch["launch_id"]
             asin = launch["source_asin"]
             stage = int(launch["current_stage"])
+            launch_name = launch_label(launch)
             category = launch.get("pursuit_category")
             created = launch["created_at"]
-            created_str = created.strftime("%Y-%m-%d") if hasattr(created, "strftime") else str(created)
+            created_str = (
+                created.strftime("%Y-%m-%d")
+                if hasattr(created, "strftime")
+                else str(created)
+            )
+            archived_badge = "📦 Archived" if bool(launch.get("is_archived")) else ""
 
             badge = pursuit_badge(category)
             stage_label = stage_badge(stage)
@@ -292,10 +309,12 @@ else:
             rows_html += (
                 f"<tr>"
                 f"<td style='padding:8px'><b>#{lid}</b></td>"
+                f"<td style='padding:8px'>{launch_name}</td>"
                 f"<td style='padding:8px'><code>{asin}</code></td>"
                 f"<td style='padding:8px'>{stage_label}</td>"
                 f"<td style='padding:8px'>{badge}</td>"
                 f"<td style='padding:8px'>{created_str}</td>"
+                f"<td style='padding:8px'>{archived_badge}</td>"
                 f"</tr>"
             )
 
@@ -304,10 +323,12 @@ else:
           <thead>
             <tr style='background:#F0F2F6;text-align:left'>
               <th style='padding:8px'>Launch ID</th>
+              <th style='padding:8px'>Launch Name</th>
               <th style='padding:8px'>Source ASIN</th>
               <th style='padding:8px'>Current Stage</th>
               <th style='padding:8px'>Pursuit Category</th>
               <th style='padding:8px'>Created</th>
+              <th style='padding:8px'>Status</th>
             </tr>
           </thead>
           <tbody>
@@ -322,18 +343,24 @@ else:
         # Launch detail selector
         st.subheader("Launch Detail")
         launch_ids = [l["launch_id"] for l in filtered]
-        default_idx = 0
-        if st.session_state.get("selected_launch_id") in launch_ids:
-            default_idx = launch_ids.index(st.session_state["selected_launch_id"])
+        selected_id: int | None = None
+        if not launch_ids:
+            st.info("No launches match the selected filters.")
+        else:
+            default_idx = 0
+            if st.session_state.get("selected_launch_id") in launch_ids:
+                default_idx = launch_ids.index(st.session_state["selected_launch_id"])
 
-        selected_id = st.selectbox(
-            "Select a launch to view details",
-            options=launch_ids,
-            index=default_idx,
-            format_func=lambda lid: f"#{lid} — {next((l['source_asin'] for l in filtered if l['launch_id'] == lid), '')}",
-        )
+            selected_id = st.selectbox(
+                "Select a launch to view details",
+                options=launch_ids,
+                index=default_idx,
+                format_func=lambda lid: (
+                    f"#{lid} — {next((l['source_asin'] for l in filtered if l['launch_id'] == lid), '')}"
+                ),
+            )
 
-        if selected_id:
+        if selected_id is not None:
             st.session_state["selected_launch_id"] = selected_id
             try:
                 lsm = LaunchStateManager()
@@ -350,19 +377,42 @@ else:
 
                 info_col1, info_col2 = st.columns(2)
                 with info_col1:
-                    st.markdown(f"**Pursuit Category:** {pursuit_badge(summary.get('pursuit_category'))}", unsafe_allow_html=True)
+                    st.markdown(f"**Launch Name:** {launch_label(summary)}")
+                    st.markdown(
+                        f"**Pursuit Category:** {pursuit_badge(summary.get('pursuit_category'))}",
+                        unsafe_allow_html=True,
+                    )
                     score = summary.get("pursuit_score")
-                    st.markdown(f"**Pursuit Score:** {score if score is not None else '—'}")
-                    st.markdown(f"**Source Marketplace:** {summary['source_marketplace']}")
-                    st.markdown(f"**Target Marketplaces:** {', '.join(summary.get('target_marketplaces') or [])}")
+                    st.markdown(
+                        f"**Pursuit Score:** {score if score is not None else '—'}"
+                    )
+                    st.markdown(
+                        f"**Source Marketplace:** {summary['source_marketplace']}"
+                    )
+                    st.markdown(
+                        f"**Target Marketplaces:** {', '.join(summary.get('target_marketplaces') or [])}"
+                    )
 
                 with info_col2:
+                    if summary.get("is_archived"):
+                        archived_at = summary.get("archived_at")
+                        if archived_at is not None:
+                            archived_str = (
+                                archived_at.strftime("%Y-%m-%d %H:%M")
+                                if hasattr(archived_at, "strftime")
+                                else str(archived_at)
+                            )
+                        else:
+                            archived_str = "yes"
+                        st.markdown(f"**Archived:** {archived_str}")
                     st.markdown(f"**Created:** {summary['created_at']}")
                     st.markdown(f"**Updated:** {summary['updated_at']}")
                     if summary.get("product_category"):
                         st.markdown(f"**Category:** {summary['product_category']}")
                     if summary.get("product_description"):
-                        st.markdown(f"**Description:** {summary['product_description']}")
+                        st.markdown(
+                            f"**Description:** {summary['product_description']}"
+                        )
 
                 # Stage advancement status
                 if summary["can_advance"]:
@@ -371,6 +421,60 @@ else:
                     st.warning("⚠️ Stage blockers:")
                     for blocker in summary["blockers"]:
                         st.markdown(f"- {blocker}")
+
+                st.markdown("---")
+                st.markdown("#### Launch Controls")
+                ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([3, 2, 2])
+
+                with ctrl_col1:
+                    edit_name = st.text_input(
+                        "Launch Name",
+                        value=str(summary.get("launch_name") or ""),
+                        placeholder="Enter a friendly launch name",
+                        key=f"launch_name_{selected_id}",
+                    )
+                with ctrl_col2:
+                    if st.button(
+                        "💾 Save Name",
+                        key=f"save_name_{selected_id}",
+                        use_container_width=True,
+                    ):
+                        updated = lsm.update_launch(
+                            conn,
+                            selected_id,
+                            launch_name=edit_name.strip() or None,
+                        )
+                        conn.commit()
+                        if updated:
+                            st.success("Launch name updated.")
+                            st.rerun()
+                        else:
+                            st.warning("Could not update launch name.")
+
+                is_archived = bool(summary.get("is_archived"))
+                with ctrl_col3:
+                    archive_label = "♻️ Unarchive" if is_archived else "🗄️ Archive"
+                    if st.button(
+                        archive_label,
+                        key=f"toggle_archive_{selected_id}",
+                        use_container_width=True,
+                    ):
+                        updated = lsm.update_launch(
+                            conn,
+                            selected_id,
+                            is_archived=not is_archived,
+                            archived_at=datetime.utcnow() if not is_archived else None,
+                        )
+                        conn.commit()
+                        if updated:
+                            st.success(
+                                "Launch archived."
+                                if not is_archived
+                                else "Launch restored."
+                            )
+                            st.rerun()
+                        else:
+                            st.warning("Could not update archive status.")
 
             except Exception as exc:  # noqa: BLE001
                 conn.rollback()
