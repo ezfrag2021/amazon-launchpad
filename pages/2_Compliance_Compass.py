@@ -413,6 +413,84 @@ def update_product_category(
     conn.commit()
 
 
+def load_saved_compliance_risk_assessment(
+    conn: psycopg.Connection, launch_id: int
+) -> dict[str, Any] | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT mitigation
+            FROM launchpad.risk_assessment
+            WHERE launch_id = %s
+              AND risk_category = 'compliance_ai'
+            ORDER BY assessed_at DESC
+            LIMIT 1
+            """,
+            (launch_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    raw_payload = row.get("mitigation")
+    if not raw_payload:
+        return None
+
+    try:
+        parsed = json.loads(str(raw_payload))
+    except Exception:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def save_compliance_risk_assessment(
+    conn: psycopg.Connection,
+    launch_id: int,
+    assessment: dict[str, Any],
+    intended_use: str,
+    materials: str,
+    selected_regimes: list[str],
+) -> None:
+    payload_assessment = dict(assessment)
+    payload_assessment["_context"] = {
+        "intended_use": intended_use,
+        "materials": materials,
+        "selected_regimes": selected_regimes,
+    }
+
+    level = str(assessment.get("overall_risk_level") or "medium").strip().lower()
+    severity_map = {
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High",
+        "critical": "Critical",
+    }
+    severity = severity_map.get(level, "Medium")
+    summary = str(assessment.get("summary") or "Compliance AI risk assessment")
+    payload = json.dumps(payload_assessment, ensure_ascii=True)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM launchpad.risk_assessment
+            WHERE launch_id = %s
+              AND risk_category = 'compliance_ai'
+            """,
+            (launch_id,),
+        )
+        cur.execute(
+            """
+            INSERT INTO launchpad.risk_assessment
+                (launch_id, risk_category, risk_description, severity, mitigation)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (launch_id, "compliance_ai", summary, severity, payload),
+        )
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
@@ -841,7 +919,7 @@ val_key = f"cc_cat_value_{lid}"
 unlock_key = f"cc_force_unlock_{lid}"
 
 if lock_key not in st.session_state:
-    st.session_state[lock_key] = False
+    st.session_state[lock_key] = bool(db_category)
 if val_key not in st.session_state:
     suggestion = _suggest_category(selected_launch.get("product_description", ""))
     cache_suggestion: str | None = None
@@ -929,6 +1007,9 @@ if category_locked:
     active_category = st.session_state.get(val_key, db_category)
     profile_key = f"cc_profile_{lid}"
     profile_confirmed_key = f"cc_profile_confirmed_{lid}"
+
+    if profile_confirmed_key not in st.session_state and existing_checklist:
+        st.session_state[profile_confirmed_key] = True
 
     if profile_key not in st.session_state:
         with st.spinner("Analyzing product profile..."):
@@ -1271,6 +1352,32 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
 
     risk_key = f"cc_risk_assessment_{lid}"
 
+    if risk_key not in st.session_state:
+        try:
+            persisted_assessment = load_saved_compliance_risk_assessment(conn, lid)
+            conn.commit()
+            if persisted_assessment:
+                st.session_state[risk_key] = persisted_assessment
+                context = persisted_assessment.get("_context", {})
+                if isinstance(context, dict):
+                    if f"cc_intended_use_{lid}" not in st.session_state:
+                        st.session_state[f"cc_intended_use_{lid}"] = str(
+                            context.get("intended_use") or ""
+                        )
+                    if f"cc_materials_{lid}" not in st.session_state:
+                        st.session_state[f"cc_materials_{lid}"] = str(
+                            context.get("materials") or ""
+                        )
+                    if (
+                        f"cc_selected_regimes_{lid}" not in st.session_state
+                        and isinstance(context.get("selected_regimes"), list)
+                    ):
+                        st.session_state[f"cc_selected_regimes_{lid}"] = [
+                            str(r) for r in context.get("selected_regimes", []) if r
+                        ]
+        except Exception:
+            conn.rollback()
+
     col_use, col_mat = st.columns(2)
     with col_use:
         intended_use = st.text_area(
@@ -1316,6 +1423,14 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
                     key_requirements=key_reqs,
                 )
                 if result:
+                    save_compliance_risk_assessment(
+                        conn,
+                        lid,
+                        result,
+                        intended_use=intended_use or "",
+                        materials=materials or "",
+                        selected_regimes=[str(r) for r in selected_regimes],
+                    )
                     st.session_state[risk_key] = result
                     record_section_save(lid, "compliance", "risk_assessment")
                     st.rerun()
@@ -1805,7 +1920,7 @@ if existing_checklist:
     # Stage completion
     # ---------------------------------------------------------------------------
     st.markdown("---")
-    st.subheader("🚀 Stage Completion")
+    st.subheader("🚀 Module Progress")
 
     lsm = LaunchStateManager()
     try:
@@ -1820,24 +1935,24 @@ if existing_checklist:
 
     if current_stage > STAGE_COMPLIANCE:
         st.success(
-            f"✅ Stage 2 already completed. This launch is at Stage {current_stage}."
+            f"✅ Module 2 already marked complete. This launch is currently at Stage {current_stage}."
         )
     elif current_stage < STAGE_COMPLIANCE:
         st.warning(
             f"⚠️ This launch is at Stage {current_stage}. "
-            "Complete Stage 1 first before working on compliance."
+            "You can continue documenting compliance here; stage advancement will unlock when prerequisites are met."
         )
     else:
         # Currently at Stage 2
         if can_advance:
             st.success(
                 "✅ All compliance requirements are completed or marked N/A. "
-                "Ready to advance to **Stage 3: Risk & Pricing Architect**."
+                "Ready to mark **Module 2** complete and advance to **Module 3: Risk & Pricing Architect**."
             )
 
             # Confirmation dialog via session state
             if st.button(
-                "🚀 Complete Stage 2 — Advance to Pricing",
+                "🚀 Complete Module 2 — Advance to Pricing",
                 type="primary",
                 key="complete_stage2",
             ):
@@ -1859,8 +1974,8 @@ if existing_checklist:
                             conn.commit()
                             if advanced:
                                 st.success(
-                                    "🎉 **Stage 2 Complete!** Launch advanced to "
-                                    "**Stage 3: Risk & Pricing Architect**."
+                                    "🎉 **Module 2 Complete!** Launch advanced to "
+                                    "**Module 3: Risk & Pricing Architect**."
                                 )
                                 st.session_state["confirm_stage2"] = False
                                 st.balloons()
@@ -1875,25 +1990,28 @@ if existing_checklist:
                         st.session_state["confirm_stage2"] = False
                         st.rerun()
         else:
-            st.error("❌ Cannot advance to Stage 3 yet. Resolve the following:")
+            st.info(
+                "ℹ️ Module 2 is still in progress. You can keep navigating and saving work; "
+                "stage advancement will become available once these items are resolved:"
+            )
             for blocker in blockers:
-                st.markdown(f"- 🚫 {blocker}")
+                st.markdown(f"- {blocker}")
 
             # Show summary of what's blocking
             if progress["pending"] > 0:
                 st.markdown(
                     f"**{progress['pending']} item(s) still pending** — "
-                    "update their status to Completed or Not Applicable."
+                    "update statuses when ready (Completed or Not Applicable) to unlock advancement."
                 )
             if progress["blocked"] > 0:
                 st.markdown(
                     f"**{progress['blocked']} item(s) are blocked** — "
-                    "resolve the blocker or mark as Not Applicable."
+                    "resolve blockers or mark as Not Applicable to unlock advancement."
                 )
             if progress["in_progress"] > 0:
                 st.markdown(
                     f"**{progress['in_progress']} item(s) in progress** — "
-                    "these must be completed before advancing."
+                    "finish these when convenient to enable advancement."
                 )
 
 elif not category_locked:

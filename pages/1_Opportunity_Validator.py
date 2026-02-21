@@ -88,6 +88,7 @@ def _init_session_state() -> None:
         "pursuit_score": None,
         "pursuit_category": None,
         "score_breakdown": None,
+        "op_hydrated_launch_id": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -105,6 +106,46 @@ def _load_launches() -> list[dict[str, Any]]:
     except Exception as exc:
         st.error(f"❌ Failed to load launches: {exc}")
         return []
+
+
+def _hydrate_from_saved_launch(selected_launch: dict[str, Any]) -> None:
+    launch_id = int(selected_launch["launch_id"])
+    if st.session_state.get("op_hydrated_launch_id") == launch_id:
+        return
+
+    st.session_state["op_hydrated_launch_id"] = launch_id
+
+    # Restore score/category from persisted launch state.
+    st.session_state["pursuit_score"] = selected_launch.get("pursuit_score")
+    st.session_state["pursuit_category"] = selected_launch.get("pursuit_category")
+    st.session_state["score_breakdown"] = None
+    st.session_state["inferred_product_category"] = selected_launch.get(
+        "product_category"
+    )
+
+    # Rehydrate competitors from cache-backed fetch so page fields repopulate after reload.
+    try:
+        with _open_conn() as conn:
+            competitors = _fetch_competitors(
+                conn=conn,
+                asin=str(selected_launch.get("source_asin") or ""),
+                target_marketplaces=list(
+                    selected_launch.get("target_marketplaces")
+                    or TARGET_MARKETPLACE_OPTIONS
+                ),
+                launch_id=launch_id,
+                source_marketplace=str(
+                    selected_launch.get("source_marketplace") or "US"
+                ),
+                source_context=str(selected_launch.get("product_description") or ""),
+                use_cache=True,
+            )
+            if competitors is not None:
+                st.session_state["competitor_data"] = competitors
+    except Exception as exc:
+        logger.info(
+            "Could not auto-hydrate competitor data for launch %s: %s", launch_id, exc
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +326,80 @@ def _render_budget_status(conn: psycopg.Connection) -> dict[str, Any] | None:
         return None
 
 
+def _get_cache_status_for_asin(
+    conn: psycopg.Connection,
+    asin: str,
+    marketplaces: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Return latest Jungle Scout cache metadata for the ASIN."""
+    normalized_asin = "".join(ch for ch in (asin or "").upper() if ch.isalnum())
+    if len(normalized_asin) < 10:
+        return None
+
+    mkt_codes = [m.upper() for m in (marketplaces or []) if m]
+    if "UK" in mkt_codes and "GB" not in mkt_codes:
+        mkt_codes.append("GB")
+    if "GB" in mkt_codes and "UK" not in mkt_codes:
+        mkt_codes.append("UK")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT MAX(fetched_at), COUNT(*)
+            FROM launchpad.jungle_scout_cache
+            WHERE UPPER(asin) = %s
+              AND endpoint IN ('keywords_by_asin', 'sales_estimates', 'product_database')
+              AND (
+                    %s::text[] IS NULL
+                    OR cardinality(%s::text[]) = 0
+                    OR marketplace = ANY(%s::text[])
+                  )
+            """,
+            (
+                normalized_asin,
+                mkt_codes if mkt_codes else None,
+                mkt_codes if mkt_codes else [],
+                mkt_codes if mkt_codes else [],
+            ),
+        )
+        row = cur.fetchone()
+
+    if not row or row[0] is None:
+        return None
+
+    return {
+        "latest_fetched_at": row[0],
+        "cache_rows": int(row[1] or 0),
+    }
+
+
+def _get_cache_status_for_launch(
+    conn: psycopg.Connection,
+    launch_id: int,
+) -> dict[str, Any] | None:
+    """Fallback cache signal for saved launches using API call ledger."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT MAX(called_at), COUNT(*)
+            FROM launchpad.api_call_ledger
+            WHERE launch_id = %s
+              AND script_name = 'opportunity_validator'
+              AND endpoint IN ('keywords_by_asin', 'share_of_voice', 'sales_estimates', 'product_database')
+            """,
+            (launch_id,),
+        )
+        row = cur.fetchone()
+
+    if not row or row[0] is None:
+        return None
+
+    return {
+        "latest_fetched_at": row[0],
+        "cache_rows": int(row[1] or 0),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fetch competitors
 # ---------------------------------------------------------------------------
@@ -295,6 +410,7 @@ def _fetch_competitors(
     launch_id: int | None,
     source_marketplace: str = "US",
     source_context: str = "",
+    use_cache: bool = True,
 ) -> list[dict[str, Any]] | None:
     """
     Fetch competitor data from Jungle Scout for each target marketplace.
@@ -543,7 +659,7 @@ Return strict JSON only in this format:
                 marketplace=marketplace,
                 script_name="opportunity_validator",
                 launch_id=launch_id,
-                use_cache=True,
+                use_cache=use_cache,
                 ttl_hours=24,
                 include_keywords=fallback_keywords,
                 page_size=100,
@@ -606,7 +722,7 @@ Return strict JSON only in this format:
                         marketplace=marketplace,
                         script_name="opportunity_validator",
                         launch_id=launch_id,
-                        use_cache=True,
+                        use_cache=use_cache,
                         ttl_hours=24,
                     )
                     attempted += 1
@@ -639,7 +755,7 @@ Return strict JSON only in this format:
             marketplace=source_marketplace,
             script_name="opportunity_validator",
             launch_id=launch_id,
-            use_cache=True,
+            use_cache=use_cache,
             ttl_hours=24,
         )
     except Exception as exc:
@@ -722,7 +838,7 @@ Return strict JSON only in this format:
                     marketplace=marketplace,
                     script_name="opportunity_validator",
                     launch_id=launch_id,
-                    use_cache=True,
+                    use_cache=use_cache,
                     ttl_hours=24,
                 )
             except Exception as exc:
@@ -758,7 +874,7 @@ Return strict JSON only in this format:
                     marketplace=marketplace,
                     script_name="opportunity_validator",
                     launch_id=launch_id,
-                    use_cache=True,
+                    use_cache=use_cache,
                     ttl_hours=24,
                 )
             except Exception as exc:
@@ -1122,13 +1238,23 @@ def _render_pursuit_score(
         st.session_state["pursuit_category"] = category
         st.session_state["score_breakdown"] = breakdown
 
-    score = st.session_state.get("pursuit_score")
-    category = st.session_state.get("pursuit_category")
+    score_raw = st.session_state.get("pursuit_score")
+    try:
+        score = float(score_raw) if score_raw is not None else None
+    except (TypeError, ValueError):
+        score = None
+
+    category_raw = st.session_state.get("pursuit_category")
+    category = str(category_raw) if category_raw else None
     breakdown = st.session_state.get("score_breakdown")
 
     if score is None:
         st.info("Click **Calculate Pursuit Score** to analyse the opportunity.")
         return None, None
+
+    if category is None:
+        st.warning("Pursuit category is missing. Recalculate the score to continue.")
+        return score, None
 
     # Score display
     color = SCORE_COLORS.get(category, "#888888")
@@ -1327,6 +1453,7 @@ def main() -> None:
     # --- Launch selector ---
     selected_launch = _render_launch_selector()
     if selected_launch:
+        _hydrate_from_saved_launch(selected_launch)
         try:
             with _open_conn() as conn:
                 render_readiness_panel(
@@ -1355,6 +1482,50 @@ def main() -> None:
     fetch_disabled = not asin or not target_marketplaces
     if fetch_disabled and not asin:
         st.info("Enter a Source ASIN above to enable data fetching.")
+
+    cache_choice = "Use cache"
+    if asin and target_marketplaces:
+        try:
+            cache_marketplaces = list(target_marketplaces)
+            source_mkt_for_cache = str(
+                (selected_launch or {}).get("source_marketplace") or "US"
+            ).upper()
+            if source_mkt_for_cache not in cache_marketplaces:
+                cache_marketplaces.append(source_mkt_for_cache)
+
+            with _open_conn() as conn:
+                cache_status = _get_cache_status_for_asin(
+                    conn,
+                    asin,
+                    cache_marketplaces,
+                )
+                if cache_status is None and selected_launch is not None:
+                    cache_status = _get_cache_status_for_launch(
+                        conn,
+                        int(selected_launch["launch_id"]),
+                    )
+        except Exception:
+            cache_status = None
+
+        if cache_status:
+            latest = cache_status.get("latest_fetched_at")
+            if latest is not None and hasattr(latest, "strftime"):
+                latest_str = latest.strftime("%d:%m:%y %H:%M UTC")
+            elif latest is not None:
+                latest_str = str(latest)
+            else:
+                latest_str = "unknown"
+            st.info(
+                f"We have cached Jungle Scout data for ASIN `{asin.upper()}` dated {latest_str}. "
+                "Choose whether to use cache or refresh."
+            )
+            cache_choice = st.radio(
+                "Market data source",
+                options=["Use cache", "Re-run search"],
+                horizontal=True,
+                key=f"cache_choice_{asin.upper()}",
+                help="Use cache avoids billable API calls when cached records exist.",
+            )
 
     fetch_col, mock_col = st.columns([3, 2])
 
@@ -1385,8 +1556,13 @@ def main() -> None:
         else:
             launch_id = selected_launch["launch_id"] if selected_launch else None
             st.session_state["inferred_product_category"] = None
+            use_cache = cache_choice != "Re-run search"
 
-            with st.spinner("Fetching competitor data from Jungle Scout..."):
+            with st.spinner(
+                "Loading competitor data from cache..."
+                if use_cache
+                else "Refreshing competitor data from Jungle Scout..."
+            ):
                 try:
                     with _open_conn() as conn:
                         source_mkt = str(
@@ -1402,6 +1578,7 @@ def main() -> None:
                             launch_id,
                             source_marketplace=source_mkt,
                             source_context=source_context,
+                            use_cache=use_cache,
                         )
                 except Exception as exc:
                     st.error(f"❌ Connection error: {exc}")
@@ -1415,7 +1592,7 @@ def main() -> None:
 
                 if competitors:
                     st.success(
-                        f"✅ Fetched {len(competitors)} competitors across {len(target_marketplaces)} marketplace(s)."
+                        f"✅ Loaded {len(competitors)} competitors across {len(target_marketplaces)} marketplace(s)."
                     )
                 else:
                     st.warning(

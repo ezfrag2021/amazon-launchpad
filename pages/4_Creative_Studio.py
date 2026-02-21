@@ -13,6 +13,7 @@ import csv
 import io
 import json
 import logging
+import re
 import zipfile
 from typing import Any
 
@@ -145,6 +146,9 @@ def _init_session_state() -> None:
         "cs_rufus_optimize": False,
         # Active marketplace tab
         "cs_active_marketplace": "UK",
+        "cs_prefill_launch_id": None,
+        "cs_key_features_prefill_attempted_launch_id": None,
+        "cs_hydrated_launch_id": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -256,27 +260,419 @@ def _render_launch_info(launch: dict[str, Any]) -> None:
                     margin_str = f"{margin:.1f}%" if margin else "—"
                     pcols[i].metric(label, price_str, delta=f"Margin: {margin_str}")
 
-            # Load PPC keywords for pre-population
-            with _open_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT DISTINCT keyword
-                        FROM launchpad.ppc_simulation
-                        WHERE launch_id = %s
-                        ORDER BY keyword
-                        LIMIT 20
-                        """,
-                        (launch_id,),
-                    )
-                    kw_rows = cur.fetchall()
-            if kw_rows and not st.session_state.get("cs_target_keywords"):
-                st.session_state["cs_target_keywords"] = ", ".join(
-                    r[0] for r in kw_rows
-                )
-
         except Exception as exc:
             logger.warning("Could not load pricing/PPC data: %s", exc)
+
+
+def _strip_markdown_fences(raw_text: str) -> str:
+    text = (raw_text or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+    return text.strip()
+
+
+_ISO_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _normalize_keyword_candidate(value: str) -> str:
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return ""
+
+    if "/" in text:
+        parts = text.split("/", 1)
+        if len(parts) == 2 and len(parts[0]) <= 3 and parts[0].isalpha():
+            text = parts[1].strip()
+
+    text_l = text.lower()
+    if text_l in {"keywords_by_asin_result", "keywords_by_asin"}:
+        return ""
+    if _ISO_TS_RE.match(text):
+        return ""
+    if len(text) == 10 and text.isalnum():
+        return ""
+    if len(text) > 100:
+        return ""
+    if not any(ch.isalpha() for ch in text):
+        return ""
+    return text
+
+
+def _extract_keywords_from_js_payload(payload: Any, limit: int = 20) -> list[str]:
+    extracted: list[str] = []
+    seen: set[str] = set()
+
+    def _push(candidate: Any) -> None:
+        if len(extracted) >= limit:
+            return
+        if not isinstance(candidate, str):
+            return
+        keyword = _normalize_keyword_candidate(candidate)
+        if not keyword:
+            return
+        key_l = keyword.lower()
+        if key_l in seen:
+            return
+        seen.add(key_l)
+        extracted.append(keyword)
+
+    rows: list[Any] = []
+    if isinstance(payload, dict):
+        data_val = payload.get("data")
+        if isinstance(data_val, list):
+            rows.extend(data_val)
+        for key in ["keywords", "search_terms", "results"]:
+            maybe_list = payload.get(key)
+            if isinstance(maybe_list, list):
+                rows.extend(maybe_list)
+        for key in ["keyword", "search_term", "query", "term", "name"]:
+            _push(payload.get(key))
+    elif isinstance(payload, list):
+        rows.extend(payload)
+
+    for row in rows:
+        if len(extracted) >= limit:
+            break
+        if isinstance(row, dict):
+            attrs = row.get("attributes")
+            if isinstance(attrs, dict):
+                _push(attrs.get("name"))
+                _push(attrs.get("keyword"))
+                _push(attrs.get("search_term"))
+            _push(row.get("keyword"))
+            _push(row.get("search_term"))
+            _push(row.get("query"))
+            _push(row.get("term"))
+            _push(row.get("name"))
+        elif isinstance(row, str):
+            _push(row)
+
+    return extracted
+
+
+def _build_opportunity_snapshot(
+    launch: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    launch_id = int(launch["launch_id"])
+    snapshot: dict[str, Any] = {
+        "launch": {
+            "launch_id": launch_id,
+            "source_asin": launch.get("source_asin"),
+            "source_marketplace": launch.get("source_marketplace"),
+            "target_marketplaces": launch.get("target_marketplaces") or [],
+            "product_category": launch.get("product_category"),
+            "product_description": launch.get("product_description"),
+            "pursuit_score": launch.get("pursuit_score"),
+            "pursuit_category": launch.get("pursuit_category"),
+        }
+    }
+
+    keyword_rows: list[tuple[Any, ...]] = []
+    pricing_rows: list[dict[str, Any]] = []
+    risk_rows: list[dict[str, Any]] = []
+    js_keyword_payloads: list[Any] = []
+
+    with _open_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT keyword
+                FROM launchpad.ppc_simulation
+                WHERE launch_id = %s
+                ORDER BY keyword
+                LIMIT 20
+                """,
+                (launch_id,),
+            )
+            keyword_rows = cur.fetchall()
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT marketplace, recommended_launch_price, margin_estimate_pct,
+                       competitor_count, analyzed_at
+                FROM launchpad.pricing_analysis
+                WHERE launch_id = %s
+                ORDER BY analyzed_at DESC
+                LIMIT 10
+                """,
+                (launch_id,),
+            )
+            pricing_rows = list(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT risk_category, risk_description, severity, mitigation, assessed_at
+                FROM launchpad.risk_assessment
+                WHERE launch_id = %s
+                ORDER BY assessed_at DESC
+                LIMIT 10
+                """,
+                (launch_id,),
+            )
+            risk_rows = list(cur.fetchall())
+
+            source_asin = str(launch.get("source_asin") or "").strip().upper()
+            if source_asin:
+                cur.execute(
+                    """
+                    SELECT response_data
+                    FROM launchpad.jungle_scout_cache
+                    WHERE asin = %s
+                      AND endpoint = 'keywords_by_asin'
+                    ORDER BY fetched_at DESC
+                    LIMIT 8
+                    """,
+                    (source_asin,),
+                )
+                js_keyword_payloads = [r.get("response_data") for r in cur.fetchall()]
+
+    keywords = [str(row[0]).strip() for row in keyword_rows if row and row[0]]
+
+    if not keywords and js_keyword_payloads:
+        extracted: list[str] = []
+        seen: set[str] = set()
+        for payload in js_keyword_payloads:
+            if len(extracted) >= 20:
+                break
+            for kw in _extract_keywords_from_js_payload(payload, limit=20):
+                key_l = kw.lower()
+                if key_l in seen:
+                    continue
+                seen.add(key_l)
+                extracted.append(kw)
+                if len(extracted) >= 20:
+                    break
+
+        keywords = extracted
+
+    snapshot["ppc_keywords"] = keywords
+    snapshot["pricing_summary"] = pricing_rows
+    snapshot["risk_summary"] = risk_rows
+    return snapshot, keywords
+
+
+def _generate_key_features_from_snapshot(snapshot: dict[str, Any]) -> str:
+    try:
+        genai = get_generative_client()
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        prompt = f"""You are drafting Amazon listing key features for the Creative Studio form.
+
+Use the provided opportunity report snapshot and return concise, factual feature bullets.
+
+Rules:
+- Return STRICT JSON only.
+- Output shape: {{"key_features": ["...", "..."]}}
+- Include 4 to 6 feature bullets.
+- Keep each bullet under 110 characters.
+- Focus on product value/benefit statements, not pricing or risk details.
+- If data is sparse, infer reasonable product benefits from product description and keywords.
+
+Snapshot:
+{json.dumps(snapshot, default=str, ensure_ascii=True)}
+"""
+        response = model.generate_content(prompt)
+        parsed = json.loads(
+            _strip_markdown_fences(str(getattr(response, "text", "") or ""))
+        )
+        rows = parsed.get("key_features", []) if isinstance(parsed, dict) else []
+        if not isinstance(rows, list):
+            return ""
+
+        features: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            text = " ".join(str(row or "").strip().split())
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            features.append(text)
+            if len(features) >= 6:
+                break
+
+        return "\n".join(features)
+    except Exception as exc:
+        logger.info("Gemini key-feature prefill unavailable: %s", exc)
+        return ""
+
+
+def _generate_keywords_from_snapshot(snapshot: dict[str, Any]) -> str:
+    try:
+        genai = get_generative_client()
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        prompt = f"""You are drafting target keywords for an Amazon listing form.
+
+Rules:
+- Return STRICT JSON only.
+- Output shape: {{"target_keywords": ["...", "..."]}}
+- Include 10 to 20 concise search phrases.
+- Avoid duplicates and very broad one-word terms.
+
+Snapshot:
+{json.dumps(snapshot, default=str, ensure_ascii=True)}
+"""
+        response = model.generate_content(prompt)
+        parsed = json.loads(
+            _strip_markdown_fences(str(getattr(response, "text", "") or ""))
+        )
+        rows = parsed.get("target_keywords", []) if isinstance(parsed, dict) else []
+        if not isinstance(rows, list):
+            return ""
+
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            text = " ".join(str(row or "").strip().split())
+            if len(text) < 3:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            keywords.append(text)
+            if len(keywords) >= 20:
+                break
+
+        return ", ".join(keywords)
+    except Exception as exc:
+        logger.info("Gemini keyword prefill unavailable: %s", exc)
+        return ""
+
+
+def _prefill_listing_inputs(launch: dict[str, Any]) -> None:
+    launch_id = int(launch["launch_id"])
+    launch_changed = st.session_state.get("cs_prefill_launch_id") != launch_id
+
+    if launch_changed:
+        st.session_state["cs_prefill_launch_id"] = launch_id
+        st.session_state["cs_target_keywords"] = ""
+        st.session_state["cs_key_features"] = ""
+        st.session_state["cs_target_keywords_input"] = ""
+        st.session_state["cs_key_features_input"] = ""
+        st.session_state["cs_key_features_prefill_attempted_launch_id"] = None
+
+    try:
+        snapshot, keywords = _build_opportunity_snapshot(launch)
+    except Exception as exc:
+        logger.warning(
+            "Could not prefill listing inputs for launch %s: %s", launch_id, exc
+        )
+        return
+
+    keywords_text = ", ".join(keywords) if keywords else ""
+    if not keywords_text:
+        keywords_text = _generate_keywords_from_snapshot(snapshot)
+
+    if keywords_text and (
+        launch_changed or not st.session_state.get("cs_target_keywords")
+    ):
+        st.session_state["cs_target_keywords"] = keywords_text
+        st.session_state["cs_target_keywords_input"] = keywords_text
+
+    if st.session_state.get("cs_key_features"):
+        return
+
+    attempted_launch_id = st.session_state.get(
+        "cs_key_features_prefill_attempted_launch_id"
+    )
+    if attempted_launch_id == launch_id:
+        return
+
+    st.session_state["cs_key_features_prefill_attempted_launch_id"] = launch_id
+
+    generated_features = _generate_key_features_from_snapshot(snapshot)
+    if generated_features:
+        st.session_state["cs_key_features"] = generated_features
+        st.session_state["cs_key_features_input"] = generated_features
+
+
+def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
+    launch_id = int(launch["launch_id"])
+    if st.session_state.get("cs_hydrated_launch_id") == launch_id:
+        return
+
+    st.session_state["cs_hydrated_launch_id"] = launch_id
+
+    target_mps = launch.get("target_marketplaces") or TARGET_MARKETPLACES
+    preferred_mp = str(target_mps[0]) if target_mps else "UK"
+
+    try:
+        with _open_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT marketplace, title, bullets, description, backend_keywords,
+                           rufus_optimized, a_plus_content
+                    FROM launchpad.listing_drafts
+                    WHERE launch_id = %s
+                    ORDER BY (marketplace = %s) DESC, generated_at DESC
+                    LIMIT 1
+                    """,
+                    (launch_id, preferred_mp),
+                )
+                row = cur.fetchone()
+
+        if not row:
+            st.session_state["cs_generated_listing"] = None
+            st.session_state["cs_edited_listing"] = None
+            return
+
+        bullets = row.get("bullets", [])
+        if isinstance(bullets, str):
+            try:
+                bullets = json.loads(bullets)
+            except Exception:
+                bullets = []
+        if not isinstance(bullets, list):
+            bullets = []
+
+        aplus = row.get("a_plus_content")
+        if isinstance(aplus, str):
+            try:
+                aplus = json.loads(aplus) if aplus else None
+            except Exception:
+                aplus = None
+
+        restored_listing = {
+            "title": row.get("title", ""),
+            "bullets": bullets,
+            "description": row.get("description", ""),
+            "backend_keywords": row.get("backend_keywords", ""),
+            "a_plus_content": aplus,
+            "quality_score": 75,
+            "quality_notes": ["Loaded from saved draft"],
+            "optimization_suggestions": [],
+        }
+
+        st.session_state["cs_generated_listing"] = restored_listing
+        st.session_state["cs_edited_listing"] = restored_listing
+        st.session_state["cs_active_marketplace"] = str(
+            row.get("marketplace") or preferred_mp
+        )
+        st.session_state["cs_rufus_optimize"] = bool(row.get("rufus_optimized"))
+        st.session_state["cs_include_aplus"] = bool(aplus)
+
+        backend_keywords = str(row.get("backend_keywords") or "")
+        if backend_keywords:
+            st.session_state["cs_target_keywords"] = backend_keywords
+            st.session_state["cs_target_keywords_input"] = backend_keywords
+
+        if bullets:
+            bullets_text = "\n".join(str(b).strip() for b in bullets if str(b).strip())
+            if bullets_text:
+                st.session_state["cs_key_features"] = bullets_text
+                st.session_state["cs_key_features_input"] = bullets_text
+
+        if not st.session_state.get("cs_product_name"):
+            st.session_state["cs_product_name"] = str(row.get("title") or "")[:100]
+    except Exception as exc:
+        logger.warning(
+            "Could not hydrate creative state for launch %s: %s", launch_id, exc
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +696,24 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
     render_section_save_status(int(launch["launch_id"]), "creative", "listing_draft")
     launch_description = launch.get("product_description") or ""
 
+    if "cs_product_name_input" not in st.session_state:
+        st.session_state["cs_product_name_input"] = (
+            st.session_state.get("cs_product_name") or launch_description[:100]
+        )
+    if "cs_key_features_input" not in st.session_state:
+        st.session_state["cs_key_features_input"] = st.session_state.get(
+            "cs_key_features", ""
+        )
+    if "cs_target_keywords_input" not in st.session_state:
+        st.session_state["cs_target_keywords_input"] = st.session_state.get(
+            "cs_target_keywords", ""
+        )
+
     col1, col2 = st.columns(2)
 
     with col1:
         product_name = st.text_input(
             "Product Name / Title",
-            value=st.session_state.get("cs_product_name") or launch_description[:100],
             placeholder="e.g. Premium Stainless Steel Water Bottle 32oz",
             key="cs_product_name_input",
             help="Auto-populated from Module 1 product description.",
@@ -314,7 +722,6 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
 
         key_features = st.text_area(
             "Key Features (one per line)",
-            value=st.session_state.get("cs_key_features", ""),
             placeholder="BPA-free stainless steel\nDouble-wall vacuum insulation\nLeakproof lid\n24-hour cold / 12-hour hot",
             height=120,
             key="cs_key_features_input",
@@ -325,7 +732,6 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
     with col2:
         target_keywords = st.text_area(
             "Target Keywords (comma-separated)",
-            value=st.session_state.get("cs_target_keywords", ""),
             placeholder="water bottle, insulated bottle, stainless steel bottle",
             height=80,
             key="cs_target_keywords_input",
@@ -495,7 +901,7 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
         height=80,
         key="cs_edit_title",
     )
-    title_len = len(title_val)
+    title_len = len(title_val or "")
     title_color = "🔴" if title_len > AMAZON_LIMITS["title"] else "🟢"
     st.caption(f"{title_color} {title_len} / {AMAZON_LIMITS['title']} characters")
     edited["title"] = title_val
@@ -511,7 +917,7 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
             height=80,
             key=f"cs_edit_bullet_{i}",
         )
-        b_len = len(b_val)
+        b_len = len(b_val or "")
         b_color = "🔴" if b_len > AMAZON_LIMITS["bullet"] else "🟢"
         st.caption(f"{b_color} {b_len} / {AMAZON_LIMITS['bullet']} characters")
         edited_bullets.append(b_val)
@@ -524,7 +930,7 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
         height=150,
         key="cs_edit_description",
     )
-    desc_len = len(desc_val)
+    desc_len = len(desc_val or "")
     desc_color = "🔴" if desc_len > AMAZON_LIMITS["description"] else "🟢"
     st.caption(f"{desc_color} {desc_len} / {AMAZON_LIMITS['description']} characters")
     edited["description"] = desc_val
@@ -537,7 +943,7 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
         key="cs_edit_backend_kw",
         help="Space-separated, max 250 bytes. No commas, no repetition of title/bullet keywords.",
     )
-    bk_bytes = len(bk_val.encode("utf-8"))
+    bk_bytes = len((bk_val or "").encode("utf-8"))
     bk_color = "🔴" if bk_bytes > AMAZON_LIMITS["backend_keywords"] else "🟢"
     st.caption(f"{bk_color} {bk_bytes} / {AMAZON_LIMITS['backend_keywords']} bytes")
     edited["backend_keywords"] = bk_val
@@ -610,7 +1016,8 @@ def _save_listing_draft(
                     """,
                     (launch_id, marketplace),
                 )
-                next_version = cur.fetchone()[0]
+                next_version_row = cur.fetchone()
+                next_version = next_version_row[0] if next_version_row else 1
 
             aplus = listing.get("a_plus_content")
 
@@ -1304,6 +1711,8 @@ def main() -> None:
     _show_stage_readiness_notice(selected_launch)
 
     _render_launch_info(selected_launch)
+    _hydrate_saved_creative_state(selected_launch)
+    _prefill_listing_inputs(selected_launch)
     st.divider()
 
     launch_id = selected_launch["launch_id"]
