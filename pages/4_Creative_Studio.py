@@ -10,19 +10,25 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import io
 import json
 import logging
+import os
+import random
 import re
+import time
 import zipfile
+from datetime import datetime, timezone
 from typing import Any
 
 import psycopg
 import streamlit as st
 from dotenv import load_dotenv
+from psycopg import errors
 from psycopg.rows import dict_row
 
-from services.auth_manager import get_generative_client
+from services.auth_manager import get_generative_client, get_vertex_genai_client
 from services.db_connection import connect, resolve_dsn
 from services.launch_state import LaunchStateManager
 from services.workflow_ui import (
@@ -32,15 +38,6 @@ from services.workflow_ui import (
 )
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Module 4: Creative Studio",
-    page_icon="🎨",
-    layout="wide",
-)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -94,6 +91,45 @@ IMAGE_SLOTS: dict[int, dict[str, str]] = {
     },
 }
 
+APLUS_IMAGE_SPECS: dict[str, dict[str, Any]] = {
+    "hero_banner": {
+        "width": 970,
+        "height": 600,
+        "slot_type": "lifestyle",
+        "desc": "Main hero image with product in-brand context",
+    },
+    "brand_story": {
+        "width": 970,
+        "height": 600,
+        "slot_type": "in_use",
+        "desc": "Brand story visual with human/product interaction",
+    },
+    "feature_1": {
+        "width": 300,
+        "height": 300,
+        "slot_type": "infographic",
+        "desc": "Feature tile image 1",
+    },
+    "feature_2": {
+        "width": 300,
+        "height": 300,
+        "slot_type": "infographic",
+        "desc": "Feature tile image 2",
+    },
+    "feature_3": {
+        "width": 300,
+        "height": 300,
+        "slot_type": "infographic",
+        "desc": "Feature tile image 3",
+    },
+    "comparison": {
+        "width": 150,
+        "height": 300,
+        "slot_type": "comparison",
+        "desc": "Comparison chart product image",
+    },
+}
+
 AMAZON_LIMITS = {
     "title": 200,
     "bullet": 500,
@@ -101,11 +137,83 @@ AMAZON_LIMITS = {
     "backend_keywords": 250,
 }
 
-GEMINI_MODEL = "gemini-2.0-flash"
-IMAGEN_MODEL = "imagen-3.0-generate-001"
+EU_UK_MARKETPLACES = {"UK", "DE", "FR", "IT", "ES"}
+
+DEFAULT_EU_UK_RESTRICTED_MARKETING_PHRASES = [
+    "physician recommended",
+    "physician-recommended",
+    "doctor recommended",
+    "clinically proven",
+    "clinically tested",
+    "medical grade",
+    "therapeutic",
+    "heals",
+    "cures",
+    "treats",
+    "prevents disease",
+    "BPA free",
+    "BPA-free",
+    "phthalate free",
+    "phthalate-free",
+    "non toxic",
+    "non-toxic",
+    "chemical free",
+    "chemical-free",
+]
+
+DEFAULT_GLOBAL_PROHIBITED_LISTING_TERMS = [
+    "#1",
+    "number one",
+    "best seller",
+    "guaranteed",
+    "risk free",
+    "100% safe",
+    "FDA approved",
+    "CE certified",
+    "genuine",
+    "authentic",
+    "free shipping",
+    "click here",
+    "buy now",
+    "limited time",
+    "cancer",
+    "arthritis",
+    "diabetes",
+    "covid",
+    "aspirin",
+    "ibuprofen",
+    "tylenol",
+    "nike",
+    "adidas",
+    "apple",
+    "samsung",
+    "amazon basics",
+]
 
 # Load environment variables
 load_dotenv()
+
+GEMINI_MODEL = os.getenv("CREATIVE_GEMINI_MODEL", "gemini-2.5-flash")
+IMAGEN_MODEL = os.getenv("CREATIVE_IMAGEN_MODEL", "imagen-3.0-generate-002")
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+INLINE_IMAGE_PREFIX = "inline:base64,"
+IMAGEN_RETRY_MAX_ATTEMPTS = max(0, int(os.getenv("CREATIVE_IMAGEN_MAX_RETRIES", "4")))
+IMAGEN_RETRY_BASE_SECONDS = max(
+    0.25, float(os.getenv("CREATIVE_IMAGEN_RETRY_BASE_SECONDS", "1.5"))
+)
+IMAGEN_RETRY_MAX_SECONDS = max(
+    IMAGEN_RETRY_BASE_SECONDS,
+    float(os.getenv("CREATIVE_IMAGEN_RETRY_MAX_SECONDS", "20")),
+)
+APLUS_IMAGE_CALL_SPACING_SECONDS = max(
+    0.0, float(os.getenv("CREATIVE_APLUS_IMAGE_CALL_SPACING_SECONDS", "0.4"))
+)
+IMAGEN_QUOTA_COOLDOWN_SECONDS = max(
+    10.0, float(os.getenv("CREATIVE_IMAGEN_QUOTA_COOLDOWN_SECONDS", "60"))
+)
+IMAGEN_STRICT_CALL_SPACING_SECONDS = max(
+    0.0, float(os.getenv("CREATIVE_IMAGEN_STRICT_CALL_SPACING_SECONDS", "60"))
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,10 +242,14 @@ def _init_session_state() -> None:
         "cs_target_keywords": "",
         "cs_brand_voice": "Professional",
         "cs_include_aplus": False,
+        "cs_aplus_package": None,
+        "cs_aplus_asset_cache": {},
+        "cs_aplus_last_run_stats": None,
         "cs_generated_listing": None,
         "cs_edited_listing": None,
         # Image gallery: slot_number -> image data dict
         "cs_image_gallery": {},
+        "cs_upload_fingerprints": {},
         # Versions
         "cs_draft_versions": [],
         "cs_compare_v1": None,
@@ -149,6 +261,9 @@ def _init_session_state() -> None:
         "cs_prefill_launch_id": None,
         "cs_key_features_prefill_attempted_launch_id": None,
         "cs_hydrated_launch_id": None,
+        "cs_enforce_listing_policy": True,
+        "cs_additional_blocked_terms": "",
+        "cs_imagen_strict_spacing": True,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -170,11 +285,18 @@ def _render_header() -> None:
 # ---------------------------------------------------------------------------
 # Launch selector
 # ---------------------------------------------------------------------------
-def _load_launches() -> list[dict[str, Any]]:
+def _load_launches(
+    include_archived: bool = False, archived_only: bool = False
+) -> list[dict[str, Any]]:
     try:
         with _open_conn() as conn:
             mgr = LaunchStateManager()
-            launches = mgr.list_launches(conn, limit=100)
+            launches = mgr.list_launches(
+                conn,
+                limit=100,
+                include_archived=include_archived,
+                archived_only=archived_only,
+            )
             st.session_state["cs_launches"] = launches
             return launches
     except Exception as exc:
@@ -182,37 +304,122 @@ def _load_launches() -> list[dict[str, Any]]:
         return []
 
 
+def _format_launch_selector_label(launch: dict[str, Any]) -> str:
+    launch_name = str(launch.get("launch_name") or "").strip()
+    base = launch_name or str(launch.get("source_asin") or "")
+    archived_badge = " • Archived" if bool(launch.get("is_archived")) else ""
+    return (
+        f"#{launch['launch_id']} — {base} "
+        f"(Stage {launch['current_stage']}, {launch.get('pursuit_category') or 'unscored'}{archived_badge})"
+    )
+
+
 def _render_launch_selector() -> dict[str, Any] | None:
     st.subheader("📋 Select Launch")
 
-    launches = _load_launches()
+    filter_col, refresh_col = st.columns([4, 1])
+    with filter_col:
+        status_filter = st.selectbox(
+            "Launch status",
+            ["Active", "Archived", "All"],
+            key="cs_launch_status_filter",
+        )
+    with refresh_col:
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
 
-    col_select, col_refresh = st.columns([4, 1])
+    launches = _load_launches(
+        include_archived=(status_filter != "Active"),
+        archived_only=(status_filter == "Archived"),
+    )
+
+    col_select, col_manage = st.columns([4, 2])
 
     with col_select:
         if not launches:
-            st.warning("No launches found. Complete Stage 1 first.")
+            st.warning("No launches found for this filter.")
             return None
 
-        options = {
-            f"#{l['launch_id']} — {l['source_asin']} (Stage {l['current_stage']}, {l.get('pursuit_category') or 'unscored'})": l[
-                "launch_id"
-            ]
-            for l in launches
-        }
+        options = {_format_launch_selector_label(l): l["launch_id"] for l in launches}
+        option_labels = list(options.keys())
+        selected_launch_id = st.session_state.get("cs_selected_launch_id")
+        default_index = 0
+        if selected_launch_id in options.values():
+            selected_label = next(
+                label for label, lid in options.items() if lid == selected_launch_id
+            )
+            default_index = option_labels.index(selected_label)
         choice = st.selectbox(
-            "Select launch", list(options.keys()), key="cs_launch_selector"
+            "Select launch",
+            option_labels,
+            index=default_index,
+            key="cs_launch_selector",
         )
         launch_id = options[choice]
         st.session_state["cs_selected_launch_id"] = launch_id
-        return next((l for l in launches if l["launch_id"] == launch_id), None)
+        selected_launch = next(
+            (l for l in launches if l["launch_id"] == launch_id), None
+        )
 
-    with col_refresh:
-        if st.button("🔄 Refresh", use_container_width=True):
-            _load_launches()
-            st.rerun()
+    with col_manage:
+        if selected_launch is None:
+            return None
+        launch_id = int(selected_launch["launch_id"])
+        current_name = str(selected_launch.get("launch_name") or "")
+        launch_name_value = st.text_input(
+            "Friendly name",
+            value=current_name,
+            placeholder="e.g. Q2 Kitchen Expansion",
+            key=f"cs_launch_name_input_{launch_id}",
+        )
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("💾 Save Name", key=f"cs_save_launch_name_{launch_id}"):
+                try:
+                    with _open_conn() as conn:
+                        mgr = LaunchStateManager()
+                        updated = mgr.update_launch(
+                            conn,
+                            launch_id,
+                            launch_name=launch_name_value.strip() or None,
+                        )
+                        conn.commit()
+                    if updated:
+                        st.success("Launch name saved.")
+                        st.rerun()
+                    else:
+                        st.warning("Launch name update did not apply.")
+                except Exception as exc:
+                    st.error(f"Failed to save launch name: {exc}")
+        with btn_col2:
+            is_archived = bool(selected_launch.get("is_archived"))
+            archive_label = "♻️ Unarchive" if is_archived else "🗄️ Archive"
+            if st.button(archive_label, key=f"cs_toggle_archive_{launch_id}"):
+                try:
+                    with _open_conn() as conn:
+                        mgr = LaunchStateManager()
+                        updated = mgr.update_launch(
+                            conn,
+                            launch_id,
+                            is_archived=not is_archived,
+                            archived_at=(
+                                datetime.utcnow() if not is_archived else None
+                            ),
+                        )
+                        conn.commit()
+                    if updated:
+                        st.success(
+                            "Launch archived."
+                            if not is_archived
+                            else "Launch restored."
+                        )
+                        st.rerun()
+                    else:
+                        st.warning("Archive update did not apply.")
+                except Exception as exc:
+                    st.error(f"Failed to update archive status: {exc}")
 
-    return None
+    return selected_launch
 
 
 def _render_launch_info(launch: dict[str, Any]) -> None:
@@ -229,6 +436,12 @@ def _render_launch_info(launch: dict[str, Any]) -> None:
             col4.metric("Pursuit Score", f"{score:.1f}", delta=category)
         else:
             col4.metric("Pursuit Score", "—")
+
+        launch_name = str(launch.get("launch_name") or "").strip()
+        if launch_name:
+            st.caption(f"**Friendly Name:** {launch_name}")
+        if bool(launch.get("is_archived")):
+            st.caption("**Status:** Archived")
 
         if launch.get("product_description"):
             st.caption(f"**Description:** {launch['product_description']}")
@@ -749,13 +962,7 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
         )
         st.session_state["cs_brand_voice"] = brand_voice
 
-        include_aplus = st.checkbox(
-            "Include A+ Content modules",
-            value=st.session_state.get("cs_include_aplus", False),
-            key="cs_include_aplus_input",
-            help="Generate structured A+ Content (Enhanced Brand Content) modules.",
-        )
-        st.session_state["cs_include_aplus"] = include_aplus
+        st.caption("A+ Content is generated in the section below Image Gallery.")
 
         rufus_optimize = st.checkbox(
             "🤖 Optimize for Amazon RUFUS AI",
@@ -765,15 +972,352 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
         )
         st.session_state["cs_rufus_optimize"] = rufus_optimize
 
+        enforce_policy = st.checkbox(
+            "🛡️ Enforce listing compliance guardrails",
+            value=st.session_state.get("cs_enforce_listing_policy", True),
+            key="cs_enforce_listing_policy_input",
+            help="Applies hard length limits and removes risky prohibited terms before save.",
+        )
+        st.session_state["cs_enforce_listing_policy"] = enforce_policy
+
+        blocked_terms = st.text_area(
+            "Additional blocked terms / phrases (one per line)",
+            value=st.session_state.get("cs_additional_blocked_terms", ""),
+            placeholder="Brand names, legal claims, competitor names...",
+            height=80,
+            key="cs_additional_blocked_terms_input",
+            help="Use this to block product-specific risky terms in generated listing text.",
+        )
+        st.session_state["cs_additional_blocked_terms"] = blocked_terms
+
+        with st.expander("Policy phrase lists used by guardrails", expanded=False):
+            policy_terms = _load_listing_policy_terms()
+            source_label = (
+                "database"
+                if policy_terms.get("source") == "db"
+                else "built-in defaults"
+            )
+            st.caption(f"Current source: {source_label}")
+            if st.button("🔄 Refresh policy terms", key="cs_refresh_policy_terms"):
+                _load_listing_policy_terms.clear()
+                st.rerun()
+
+            st.caption(
+                "EU/UK restricted marketing claims (auto-applied for UK/DE/FR/IT/ES):"
+            )
+            st.code("\n".join(policy_terms.get("eu_uk", [])), language="text")
+            st.caption("Global prohibited terms (all marketplaces):")
+            st.code("\n".join(policy_terms.get("global", [])), language="text")
+
+            st.caption(
+                "Policy editor (writes to DB table launchpad.listing_policy_terms)"
+            )
+            global_terms_text = st.text_area(
+                "Global prohibited terms",
+                value="\n".join(policy_terms.get("global", [])),
+                height=120,
+                key="cs_policy_global_editor",
+            )
+            eu_terms_text = st.text_area(
+                "EU/UK restricted terms",
+                value="\n".join(policy_terms.get("eu_uk", [])),
+                height=120,
+                key="cs_policy_euuk_editor",
+            )
+            if st.button("💾 Save policy terms to DB", key="cs_save_policy_terms_db"):
+                if _save_listing_policy_terms_to_db(global_terms_text, eu_terms_text):
+                    _load_listing_policy_terms.clear()
+                    st.success("Policy terms saved to DB.")
+                    st.rerun()
+
+
+def _split_phrase_lines(raw_text: str) -> list[str]:
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for line in (raw_text or "").splitlines():
+        item = " ".join(line.strip().split())
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        phrases.append(item)
+    return phrases
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_listing_policy_terms() -> dict[str, Any]:
+    fallback = {
+        "global": list(DEFAULT_GLOBAL_PROHIBITED_LISTING_TERMS),
+        "eu_uk": list(DEFAULT_EU_UK_RESTRICTED_MARKETING_PHRASES),
+        "source": "defaults",
+    }
+    try:
+        with _open_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT scope, term
+                    FROM launchpad.listing_policy_terms
+                    WHERE is_active = TRUE
+                    ORDER BY scope, term
+                    """
+                )
+                rows = cur.fetchall()
+        if not rows:
+            return fallback
+
+        scoped: dict[str, list[str]] = {"global": [], "eu_uk": []}
+        for row in rows:
+            scope = str(row.get("scope") or "").strip().lower()
+            term = " ".join(str(row.get("term") or "").strip().split())
+            if scope in scoped and term:
+                scoped[scope].append(term)
+        if not scoped["global"] and not scoped["eu_uk"]:
+            return fallback
+        return {"global": scoped["global"], "eu_uk": scoped["eu_uk"], "source": "db"}
+    except errors.UndefinedTable:
+        return fallback
+    except Exception as exc:
+        logger.warning("Could not load listing policy terms from DB: %s", exc)
+        return fallback
+
+
+def _save_listing_policy_terms_to_db(global_terms: str, eu_uk_terms: str) -> bool:
+    try:
+        desired = {
+            "global": _split_phrase_lines(global_terms),
+            "eu_uk": _split_phrase_lines(eu_uk_terms),
+        }
+        with _open_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT scope, term
+                    FROM launchpad.listing_policy_terms
+                    WHERE scope IN ('global', 'eu_uk')
+                    """
+                )
+                existing_rows = cur.fetchall()
+
+                existing_map: dict[str, set[str]] = {"global": set(), "eu_uk": set()}
+                for row in existing_rows:
+                    scope = str(row.get("scope") or "").strip().lower()
+                    term = " ".join(str(row.get("term") or "").strip().split())
+                    if scope in existing_map and term:
+                        existing_map[scope].add(term.lower())
+
+                for scope, wanted_terms in desired.items():
+                    wanted_norm = {term.lower() for term in wanted_terms}
+
+                    for term in wanted_terms:
+                        cur.execute(
+                            """
+                            INSERT INTO launchpad.listing_policy_terms (scope, term, notes, is_active)
+                            VALUES (%s, %s, %s, TRUE)
+                            ON CONFLICT (scope, term_normalized)
+                            DO UPDATE SET is_active = TRUE, term = EXCLUDED.term, updated_at = now()
+                            """,
+                            (scope, term, "Managed from Creative Studio UI"),
+                        )
+
+                    to_deactivate = existing_map.get(scope, set()) - wanted_norm
+                    for lower_term in to_deactivate:
+                        cur.execute(
+                            """
+                            UPDATE launchpad.listing_policy_terms
+                            SET is_active = FALSE, updated_at = now()
+                            WHERE scope = %s
+                              AND term_normalized = %s
+                              AND is_active = TRUE
+                            """,
+                            (scope, lower_term),
+                        )
+
+            conn.commit()
+        return True
+    except errors.UndefinedTable:
+        st.error(
+            "❌ Policy term table not found. Run migration 013 first: "
+            "migrations/013_listing_policy_terms.sql"
+        )
+        return False
+    except Exception as exc:
+        st.error(f"❌ Failed to save policy terms: {exc}")
+        logger.error("Failed to save listing policy terms: %s", exc)
+        return False
+
+
+def _effective_blocked_phrases(marketplace: str) -> list[str]:
+    policy_terms = _load_listing_policy_terms()
+    phrases = list(policy_terms.get("global", []))
+    if marketplace in EU_UK_MARKETPLACES:
+        phrases.extend(policy_terms.get("eu_uk", []))
+    phrases.extend(
+        _split_phrase_lines(st.session_state.get("cs_additional_blocked_terms", ""))
+    )
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        key = phrase.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(phrase)
+    return deduped
+
+
+def _strip_blocked_phrases(
+    text: str, blocked_phrases: list[str]
+) -> tuple[str, list[str]]:
+    cleaned = str(text or "")
+    removed: list[str] = []
+    for phrase in sorted(blocked_phrases, key=len, reverse=True):
+        pattern = re.compile(rf"\b{re.escape(phrase)}\b", flags=re.IGNORECASE)
+        if pattern.search(cleaned):
+            cleaned = pattern.sub(" ", cleaned)
+            removed.append(phrase)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned, removed
+
+
+def _truncate_to_chars(text: str, max_chars: int) -> tuple[str, int]:
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value, 0
+    sliced = value[:max_chars]
+    if " " in sliced and max_chars > 20:
+        sliced = sliced.rsplit(" ", 1)[0].strip()
+        if not sliced:
+            sliced = value[:max_chars]
+    return sliced, len(value) - len(sliced)
+
+
+def _truncate_to_utf8_bytes(text: str, max_bytes: int) -> tuple[str, int]:
+    value = str(text or "")
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value, 0
+    out: list[str] = []
+    used = 0
+    for token in value.split():
+        token_bytes = len(token.encode("utf-8"))
+        spacer = 1 if out else 0
+        if used + spacer + token_bytes > max_bytes:
+            break
+        if spacer:
+            out.append(" ")
+            used += 1
+        out.append(token)
+        used += token_bytes
+    trimmed = "".join(out).strip()
+    if not trimmed:
+        trimmed = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return trimmed, len(encoded) - len(trimmed.encode("utf-8"))
+
+
+def _normalize_listing_with_policy(
+    listing: dict[str, Any], marketplace: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    normalized = dict(listing or {})
+    report: dict[str, Any] = {
+        "removed_phrases": [],
+        "truncated_fields": {},
+        "marketplace": marketplace,
+    }
+
+    title = str(normalized.get("title") or "").strip()
+    bullets_raw = normalized.get("bullets") or []
+    if not isinstance(bullets_raw, list):
+        bullets_raw = [str(bullets_raw)]
+    bullets = [str(b or "").strip() for b in bullets_raw if str(b or "").strip()]
+    while len(bullets) < 5:
+        bullets.append("")
+    bullets = bullets[:5]
+
+    description = str(normalized.get("description") or "").strip()
+    backend = str(normalized.get("backend_keywords") or "").replace(",", " ").strip()
+
+    if st.session_state.get("cs_enforce_listing_policy", True):
+        blocked = _effective_blocked_phrases(marketplace)
+
+        title, removed_title = _strip_blocked_phrases(title, blocked)
+        description, removed_desc = _strip_blocked_phrases(description, blocked)
+        backend, removed_backend = _strip_blocked_phrases(backend, blocked)
+
+        cleaned_bullets: list[str] = []
+        removed_bullets: list[str] = []
+        for bullet in bullets:
+            clean_b, removed_b = _strip_blocked_phrases(bullet, blocked)
+            cleaned_bullets.append(clean_b)
+            removed_bullets.extend(removed_b)
+        bullets = cleaned_bullets
+
+        removed_phrases = sorted(
+            {
+                p.lower()
+                for p in removed_title
+                + removed_desc
+                + removed_backend
+                + removed_bullets
+            }
+        )
+        report["removed_phrases"] = removed_phrases
+
+    title, title_trimmed = _truncate_to_chars(title, AMAZON_LIMITS["title"])
+    if title_trimmed > 0:
+        report["truncated_fields"]["title"] = title_trimmed
+
+    desc, desc_trimmed = _truncate_to_chars(description, AMAZON_LIMITS["description"])
+    description = desc
+    if desc_trimmed > 0:
+        report["truncated_fields"]["description"] = desc_trimmed
+
+    limited_bullets: list[str] = []
+    for idx, bullet in enumerate(bullets, 1):
+        clipped, clipped_count = _truncate_to_chars(bullet, AMAZON_LIMITS["bullet"])
+        limited_bullets.append(clipped)
+        if clipped_count > 0:
+            report["truncated_fields"][f"bullet_{idx}"] = clipped_count
+    bullets = limited_bullets
+
+    backend_tokens = []
+    seen_tokens: set[str] = set()
+    content_tokens = set(
+        re.findall(r"[a-z0-9]+", f"{title} {' '.join(bullets)}".lower())
+    )
+    for token in backend.split():
+        key = token.lower()
+        if key in seen_tokens:
+            continue
+        if key in content_tokens:
+            continue
+        seen_tokens.add(key)
+        backend_tokens.append(token)
+    backend = " ".join(backend_tokens)
+    backend, backend_trimmed = _truncate_to_utf8_bytes(
+        backend, AMAZON_LIMITS["backend_keywords"]
+    )
+    if backend_trimmed > 0:
+        report["truncated_fields"]["backend_keywords_bytes"] = backend_trimmed
+
+    normalized["title"] = title
+    normalized["bullets"] = bullets
+    normalized["description"] = description
+    normalized["backend_keywords"] = backend
+    return normalized, report
+
 
 def _build_listing_prompt(
     product_name: str,
     key_features: str,
     target_keywords: str,
     brand_voice: str,
-    include_aplus: bool,
     rufus_optimize: bool,
     marketplace: str = "UK",
+    blocked_phrases: list[str] | None = None,
 ) -> str:
     voice_desc = {
         "Professional": "authoritative, clear, and business-like",
@@ -792,15 +1336,9 @@ RUFUS AI OPTIMIZATION:
 - Structure content to answer: What is it? Who is it for? Why buy it?
 """
 
-    aplus_note = ""
-    if include_aplus:
-        aplus_note = """
-A+ CONTENT MODULES (include as JSON after the main listing):
-Generate 3 A+ Content modules:
-1. "hero_banner": {"headline": "...", "body": "...", "cta": "..."}
-2. "feature_grid": [{"icon": "emoji", "title": "...", "desc": "..."}] (4 items)
-3. "comparison_chart": {"headers": [...], "rows": [[...]]} (3 rows)
-"""
+    blocked_lines = ""
+    if blocked_phrases:
+        blocked_lines = "\n".join(f"- {p}" for p in blocked_phrases[:80])
 
     return f"""You are an expert Amazon listing copywriter specializing in {marketplace} marketplace.
 Write a complete, optimized Amazon product listing in a {voice_desc} brand voice.
@@ -811,7 +1349,6 @@ KEY FEATURES:
 
 TARGET KEYWORDS: {target_keywords}
 {rufus_note}
-{aplus_note}
 
 OUTPUT FORMAT (respond with valid JSON only, no markdown):
 {{
@@ -828,7 +1365,6 @@ OUTPUT FORMAT (respond with valid JSON only, no markdown):
   "quality_score": 85,
   "quality_notes": ["Note 1", "Note 2"],
   "optimization_suggestions": ["Suggestion 1", "Suggestion 2"]
-  {', "a_plus_content": {{...}}' if include_aplus else ""}
 }}
 
 RULES:
@@ -838,6 +1374,8 @@ RULES:
 - Backend keywords: max 250 bytes total, space-separated, no commas
 - quality_score: integer 0-100 based on keyword density, readability, compliance
 - Do NOT include markdown code blocks in response, return raw JSON only
+- Prohibited words/phrases that must NOT appear in title, bullets, description, or backend keywords:
+{blocked_lines}
 """
 
 
@@ -846,11 +1384,10 @@ def _generate_listing(
     key_features: str,
     target_keywords: str,
     brand_voice: str,
-    include_aplus: bool,
     rufus_optimize: bool,
     marketplace: str = "UK",
-) -> dict[str, Any] | None:
-    """Call Gemini to generate listing content. Returns parsed dict or None."""
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Generate listing and return (normalized_listing, policy_report)."""
     try:
         genai = get_generative_client()
         model = genai.GenerativeModel(GEMINI_MODEL)
@@ -860,9 +1397,9 @@ def _generate_listing(
             key_features,
             target_keywords,
             brand_voice,
-            include_aplus,
             rufus_optimize,
             marketplace,
+            _effective_blocked_phrases(marketplace),
         )
 
         response = model.generate_content(prompt)
@@ -873,19 +1410,24 @@ def _generate_listing(
             lines = raw_text.split("\n")
             raw_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
 
-        return json.loads(raw_text)
+        parsed = json.loads(raw_text)
+        if not isinstance(parsed, dict):
+            st.error("❌ AI response did not match expected listing object.")
+            return None, None
+        normalized, report = _normalize_listing_with_policy(parsed, marketplace)
+        return normalized, report
 
     except json.JSONDecodeError as exc:
         st.error(f"❌ AI returned invalid JSON: {exc}")
         logger.error("JSON parse error from Gemini: %s", exc)
-        return None
+        return None, None
     except FileNotFoundError as exc:
         st.error(f"❌ Google credentials not found: {exc}")
-        return None
+        return None, None
     except Exception as exc:
         st.error(f"❌ Listing generation failed: {exc}")
         logger.error("Listing generation error: %s", exc)
-        return None
+        return None, None
 
 
 def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
@@ -893,6 +1435,21 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
     st.markdown("### 📝 Generated Listing")
 
     edited = dict(listing)
+
+    policy_report = st.session_state.get("cs_listing_policy_report")
+    if isinstance(policy_report, dict):
+        truncated = policy_report.get("truncated_fields") or {}
+        removed = policy_report.get("removed_phrases") or []
+        if truncated:
+            details = ", ".join(
+                f"{k} (-{v})"
+                for k, v in sorted(truncated.items(), key=lambda item: item[0])
+            )
+            st.warning(f"Length guardrails applied: {details}")
+        if removed:
+            st.warning(
+                "Removed prohibited phrases: " + ", ".join(str(p) for p in removed[:20])
+            )
 
     # Title
     title_val = st.text_area(
@@ -1005,6 +1562,13 @@ def _save_listing_draft(
 ) -> bool:
     """Save listing draft to DB, auto-incrementing version. Returns True on success."""
     try:
+        listing_to_save = dict(listing)
+        if st.session_state.get("cs_enforce_listing_policy", True):
+            listing_to_save, report = _normalize_listing_with_policy(
+                listing_to_save, marketplace
+            )
+            st.session_state["cs_listing_policy_report"] = report
+
         with _open_conn() as conn:
             # Get next version number
             with conn.cursor() as cur:
@@ -1033,10 +1597,10 @@ def _save_listing_draft(
                         launch_id,
                         marketplace,
                         next_version,
-                        listing.get("title", ""),
-                        json.dumps(listing.get("bullets", [])),
-                        listing.get("description", ""),
-                        listing.get("backend_keywords", ""),
+                        listing_to_save.get("title", ""),
+                        json.dumps(listing_to_save.get("bullets", [])),
+                        listing_to_save.get("description", ""),
+                        listing_to_save.get("backend_keywords", ""),
                         rufus_optimized,
                         json.dumps(aplus) if aplus else None,
                         GEMINI_MODEL,
@@ -1123,48 +1687,259 @@ def _build_image_prompt(
     )
 
 
-def _generate_image_with_imagen(prompt: str) -> bytes | None:
-    """Generate image using Google Imagen 3. Returns raw bytes or None."""
+def _detect_image_mime(image_bytes: bytes) -> str:
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+def _extract_generated_image_bytes(result: Any) -> bytes | None:
+    generated_images = getattr(result, "generated_images", None) or []
+    if not generated_images:
+        return None
+
+    image_obj = getattr(generated_images[0], "image", None)
+    image_bytes = getattr(image_obj, "image_bytes", None)
+    if not image_bytes:
+        return None
+    return bytes(image_bytes)
+
+
+@st.cache_resource(show_spinner=False)
+def _image_gallery_supports_binary() -> bool:
+    """Return True when launchpad.image_gallery has image_bytes column."""
     try:
-        genai = get_generative_client()
+        with _open_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'launchpad'
+                          AND table_name = 'image_gallery'
+                          AND column_name = 'image_bytes'
+                    )
+                    """
+                )
+                row = cur.fetchone()
+                return bool(row and row[0])
+    except Exception as exc:
+        logger.warning("Could not verify image_gallery schema: %s", exc)
+        return False
 
-        # Use the imagen model via the generate_images API
-        imagen = genai.ImageGenerationModel(IMAGEN_MODEL)
-        result = imagen.generate_images(
-            prompt=prompt,
-            number_of_images=1,
-            aspect_ratio="1:1",
-            safety_filter_level="block_some",
-            person_generation="allow_adult",
+
+def _encode_inline_image(image_bytes: bytes) -> str:
+    return f"{INLINE_IMAGE_PREFIX}{base64.b64encode(image_bytes).decode('ascii')}"
+
+
+def _decode_inline_image(storage_path: str | None) -> bytes | None:
+    if not storage_path or not storage_path.startswith(INLINE_IMAGE_PREFIX):
+        return None
+    payload = storage_path[len(INLINE_IMAGE_PREFIX) :]
+    try:
+        return base64.b64decode(payload, validate=True)
+    except Exception:
+        return None
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    err = str(exc).upper()
+    return (
+        "RESOURCE_EXHAUSTED" in err
+        or "TOO MANY REQUESTS" in err
+        or "RATE LIMIT" in err
+        or "QUOTA" in err
+        or "429" in err
+    )
+
+
+def _extract_retry_after_seconds(exc: Exception) -> float | None:
+    match = re.search(r"RETRY[-_ ]?AFTER[^0-9]*([0-9]+(?:\.[0-9]+)?)", str(exc), re.I)
+    if not match:
+        return None
+    try:
+        return max(0.0, float(match.group(1)))
+    except Exception:
+        return None
+
+
+def _seconds_until_next_image_request(enforce_strict_spacing: bool = False) -> int:
+    now = time.time()
+    quota_until = float(
+        st.session_state.get("cs_imagen_quota_cooldown_until", 0.0) or 0.0
+    )
+    strict_enabled = enforce_strict_spacing and bool(
+        st.session_state.get("cs_imagen_strict_spacing", True)
+    )
+    strict_remaining = 0.0
+    if strict_enabled:
+        last_call = float(st.session_state.get("cs_imagen_last_request_at", 0.0) or 0.0)
+        strict_remaining = max(
+            0.0, IMAGEN_STRICT_CALL_SPACING_SECONDS - (now - last_call)
         )
+    return int(max(0.0, quota_until - now, strict_remaining))
 
-        if result.images:
-            return result.images[0]._image_bytes
-        return None
 
-    except AttributeError:
-        # Fallback: try via generative model if ImageGenerationModel not available
+def _mark_imagen_request_attempt() -> None:
+    st.session_state["cs_imagen_last_request_at"] = time.time()
+
+
+def _call_with_quota_retry(op_name: str, fn: Any) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(IMAGEN_RETRY_MAX_ATTEMPTS + 1):
         try:
-            genai_module = get_generative_client()
-            model = genai_module.GenerativeModel("gemini-2.0-flash-exp")
-            response = model.generate_content(
-                [f"Generate a product image: {prompt}"],
-                generation_config={"response_mime_type": "image/png"},
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_quota_error(exc) or attempt >= IMAGEN_RETRY_MAX_ATTEMPTS:
+                raise
+
+            retry_after = _extract_retry_after_seconds(exc)
+            backoff = min(
+                IMAGEN_RETRY_MAX_SECONDS,
+                IMAGEN_RETRY_BASE_SECONDS
+                * (2**attempt)
+                * (1.0 + random.random() * 0.25),
             )
-            if response.candidates and response.candidates[0].content.parts:
-                part = response.candidates[0].content.parts[0]
-                if hasattr(part, "inline_data"):
-                    return base64.b64decode(part.inline_data.data)
-        except Exception as inner_exc:
-            logger.error("Fallback image generation failed: %s", inner_exc)
-        return None
+            delay_seconds = max(
+                retry_after or 0.0,
+                backoff,
+                IMAGEN_QUOTA_COOLDOWN_SECONDS,
+            )
+            st.session_state["cs_imagen_quota_cooldown_until"] = (
+                time.time() + delay_seconds
+            )
+            logger.warning(
+                "Quota/rate limit for %s (attempt %s/%s). Retrying in %.2fs: %s",
+                op_name,
+                attempt + 1,
+                IMAGEN_RETRY_MAX_ATTEMPTS + 1,
+                delay_seconds,
+                exc,
+            )
+            time.sleep(delay_seconds)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{op_name} failed before request execution")
+
+
+def _generate_image_with_imagen(
+    prompt: str,
+    reference_image_bytes: bytes | None = None,
+    aspect_ratio: str = "1:1",
+    enforce_strict_spacing: bool = False,
+) -> tuple[bytes | None, bool]:
+    """Generate image using Vertex Imagen via google.genai SDK."""
+    try:
+        remaining = _seconds_until_next_image_request(
+            enforce_strict_spacing=enforce_strict_spacing
+        )
+        if remaining > 0:
+            st.warning(
+                f"⏳ Cooling down due to quota pacing. Please wait about {remaining}s before the next image request."
+            )
+            return None, False
+
+        _mark_imagen_request_attempt()
+        client = get_vertex_genai_client(location=VERTEX_LOCATION)
+        used_reference = False
+
+        if reference_image_bytes:
+            try:
+                source = {
+                    "prompt": prompt,
+                    "product_images": [
+                        {
+                            "product_image": {
+                                "image_bytes": reference_image_bytes,
+                                "mime_type": _detect_image_mime(reference_image_bytes),
+                            }
+                        }
+                    ],
+                }
+                result = _call_with_quota_retry(
+                    "Imagen recontext_image",
+                    lambda: client.models.recontext_image(
+                        model=IMAGEN_MODEL,
+                        source=source,
+                        config={
+                            "number_of_images": 1,
+                            "safety_filter_level": "block_some",
+                            "person_generation": "allow_adult",
+                        },
+                    ),
+                )
+                image_bytes = _extract_generated_image_bytes(result)
+                if image_bytes:
+                    return image_bytes, True
+                logger.warning(
+                    "Imagen recontext returned no generated image, falling back to text-only generation"
+                )
+            except Exception as ref_exc:
+                logger.warning(
+                    "Reference-based image generation unavailable, falling back: %s",
+                    ref_exc,
+                )
+
+        result = _call_with_quota_retry(
+            "Imagen generate_images",
+            lambda: client.models.generate_images(
+                model=IMAGEN_MODEL,
+                prompt=prompt,
+                config={
+                    "number_of_images": 1,
+                    "aspect_ratio": aspect_ratio,
+                    "safety_filter_level": "block_some",
+                    "person_generation": "allow_adult",
+                },
+            ),
+        )
+        image_bytes = _extract_generated_image_bytes(result)
+        if not image_bytes:
+            logger.warning("Imagen returned no generated_images: %s", result)
+            return None, used_reference
+
+        st.session_state["cs_imagen_quota_cooldown_until"] = 0.0
+
+        return image_bytes, used_reference
+    except ImportError as exc:
+        st.error(f"❌ Image generation dependency missing: {exc}")
+        return None, False
     except FileNotFoundError as exc:
         st.error(f"❌ Google credentials not found: {exc}")
-        return None
+        return None, False
     except Exception as exc:
+        err_text = str(exc)
+        if _is_quota_error(exc):
+            quota_hits = int(st.session_state.get("cs_imagen_quota_error_count", 0))
+            st.session_state["cs_imagen_quota_error_count"] = quota_hits + 1
+            st.session_state["cs_imagen_quota_last_error_at"] = time.time()
+            if "cs_aplus_quota_hits_current_run" in st.session_state:
+                st.session_state["cs_aplus_quota_hits_current_run"] = (
+                    int(st.session_state.get("cs_aplus_quota_hits_current_run", 0)) + 1
+                )
+            st.error(
+                "❌ Image generation is rate-limited by Google quota. "
+                f"A cooldown of about {int(IMAGEN_QUOTA_COOLDOWN_SECONDS)}s has been applied. "
+                "Please retry after cooldown, reduce selected assets, or request a quota increase."
+            )
+            logger.warning("Image generation quota limit: %s", exc)
+            return None, False
+        if "PERMISSION_DENIED" in err_text or "SERVICE_DISABLED" in err_text:
+            st.error(
+                "❌ Image generation is not authorized. "
+                "Enable Vertex AI API and grant this service account a Vertex AI role "
+                "(for example, Vertex AI User)."
+            )
         st.error(f"❌ Image generation failed: {exc}")
         logger.error("Image generation error: %s", exc)
-        return None
+        return None, False
 
 
 def _save_image_to_gallery(
@@ -1178,29 +1953,59 @@ def _save_image_to_gallery(
 ) -> bool:
     """Save image metadata to DB. Returns True on success."""
     try:
+        supports_binary = _image_gallery_supports_binary()
+        storage_value = storage_path
+        if not supports_binary and image_bytes:
+            storage_value = _encode_inline_image(image_bytes)
+
         with _open_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO launchpad.image_gallery
-                        (launch_id, slot_number, image_type, prompt_used, storage_path, model_used)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (launch_id, slot_number) DO UPDATE SET
-                        image_type   = EXCLUDED.image_type,
-                        prompt_used  = EXCLUDED.prompt_used,
-                        storage_path = EXCLUDED.storage_path,
-                        model_used   = EXCLUDED.model_used,
-                        generated_at = now()
-                    """,
-                    (
-                        launch_id,
-                        slot_number,
-                        image_type,
-                        prompt_used,
-                        storage_path,
-                        model_used,
-                    ),
-                )
+                if supports_binary:
+                    cur.execute(
+                        """
+                        INSERT INTO launchpad.image_gallery
+                            (launch_id, slot_number, image_type, prompt_used, storage_path, model_used, image_bytes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (launch_id, slot_number) DO UPDATE SET
+                            image_type   = EXCLUDED.image_type,
+                            prompt_used  = EXCLUDED.prompt_used,
+                            storage_path = EXCLUDED.storage_path,
+                            model_used   = EXCLUDED.model_used,
+                            image_bytes  = EXCLUDED.image_bytes,
+                            generated_at = now()
+                        """,
+                        (
+                            launch_id,
+                            slot_number,
+                            image_type,
+                            prompt_used,
+                            storage_value,
+                            model_used,
+                            image_bytes,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO launchpad.image_gallery
+                            (launch_id, slot_number, image_type, prompt_used, storage_path, model_used)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (launch_id, slot_number) DO UPDATE SET
+                            image_type   = EXCLUDED.image_type,
+                            prompt_used  = EXCLUDED.prompt_used,
+                            storage_path = EXCLUDED.storage_path,
+                            model_used   = EXCLUDED.model_used,
+                            generated_at = now()
+                        """,
+                        (
+                            launch_id,
+                            slot_number,
+                            image_type,
+                            prompt_used,
+                            storage_value,
+                            model_used,
+                        ),
+                    )
             conn.commit()
             return True
     except Exception as exc:
@@ -1211,28 +2016,74 @@ def _save_image_to_gallery(
 def _load_image_gallery(launch_id: int) -> dict[int, dict[str, Any]]:
     """Load image gallery records for a launch. Returns dict keyed by slot_number."""
     try:
+        supports_binary = _image_gallery_supports_binary()
         with _open_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT slot_number, image_type, prompt_used, storage_path,
-                           model_used, generated_at
-                    FROM launchpad.image_gallery
-                    WHERE launch_id = %s
-                    ORDER BY slot_number
-                    """,
-                    (launch_id,),
-                )
+                if supports_binary:
+                    cur.execute(
+                        """
+                        SELECT slot_number, image_type, prompt_used, storage_path, image_bytes,
+                               model_used, generated_at
+                        FROM launchpad.image_gallery
+                        WHERE launch_id = %s
+                        ORDER BY slot_number
+                        """,
+                        (launch_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT slot_number, image_type, prompt_used, storage_path,
+                               NULL::bytea AS image_bytes, model_used, generated_at
+                        FROM launchpad.image_gallery
+                        WHERE launch_id = %s
+                        ORDER BY slot_number
+                        """,
+                        (launch_id,),
+                    )
                 rows = cur.fetchall()
-        return {int(r["slot_number"]): dict(r) for r in rows}
+        gallery: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            data = dict(row)
+            maybe_image = data.get("image_bytes")
+            if isinstance(maybe_image, memoryview):
+                data["image_bytes"] = maybe_image.tobytes()
+            elif not maybe_image:
+                inline_image = _decode_inline_image(data.get("storage_path"))
+                if inline_image:
+                    data["image_bytes"] = inline_image
+            gallery[int(row["slot_number"])] = data
+        return gallery
     except Exception as exc:
         logger.warning("Could not load image gallery: %s", exc)
         return {}
 
 
+def _slot_has_image(data: dict[str, Any] | None) -> bool:
+    if not data:
+        return False
+    return bool(data.get("image_bytes") or data.get("storage_path"))
+
+
 def _render_image_gallery(launch: dict[str, Any]) -> None:
     st.subheader("🖼️ Image Gallery (7 Slots)")
     st.caption("Amazon requires 7 images for optimal listing performance.")
+
+    pacing_col1, pacing_col2 = st.columns([2, 3])
+    with pacing_col1:
+        strict_spacing = st.checkbox(
+            "Conservative quota mode (60s between calls)",
+            value=st.session_state.get("cs_imagen_strict_spacing", True),
+            key="cs_imagen_strict_spacing_input",
+            help="Reduces 429 quota errors by forcing a cooldown between image generation requests.",
+        )
+        st.session_state["cs_imagen_strict_spacing"] = strict_spacing
+    with pacing_col2:
+        remaining = _seconds_until_next_image_request(enforce_strict_spacing=True)
+        if remaining > 0:
+            st.info(f"Next image request available in ~{remaining}s")
+        else:
+            st.caption("Image generation ready")
 
     launch_id = launch["launch_id"]
     launch_description = launch.get("product_description") or ""
@@ -1247,7 +2098,7 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
     # Merge with session state
     gallery = st.session_state.get("cs_image_gallery", {})
     for slot_num, db_data in db_gallery.items():
-        if slot_num not in gallery:
+        if slot_num not in gallery or not gallery[slot_num].get("image_bytes"):
             gallery[slot_num] = {"status": "db_record", **db_data}
     st.session_state["cs_image_gallery"] = gallery
 
@@ -1267,7 +2118,7 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
     filled_slots = sum(
         1
         for s in range(1, 8)
-        if s in gallery and gallery[s].get("image_bytes") or s in db_gallery
+        if _slot_has_image(gallery.get(s)) or _slot_has_image(db_gallery.get(s))
     )
     st.markdown(f"**Gallery Progress:** {filled_slots} / 7 slots filled")
     if filled_slots < 7:
@@ -1287,6 +2138,11 @@ def _render_image_slot(
     slot_data = gallery.get(slot_num, {})
     has_image = bool(slot_data.get("image_bytes") or slot_data.get("storage_path"))
     status_icon = "✅" if has_image else "⬜"
+    prompt_key = f"cs_slot_prompt_{launch_id}_{slot_num}"
+    if prompt_key not in st.session_state:
+        st.session_state[prompt_key] = _build_image_prompt(
+            slot_info, product_name, product_desc
+        )
 
     with st.container(border=True):
         st.markdown(
@@ -1308,8 +2164,32 @@ def _render_image_slot(
             for req in reqs:
                 st.markdown(f"• {req}")
 
+        prompt_text = st.text_area(
+            "Generation Prompt",
+            value=st.session_state.get(prompt_key, ""),
+            key=f"{prompt_key}_input",
+            height=100,
+            help="Edit this prompt before generating the slot image.",
+        )
+        st.session_state[prompt_key] = prompt_text
+
         # Action buttons
         btn_col1, btn_col2 = st.columns(2)
+
+        has_reference = bool(slot_data.get("image_bytes"))
+        use_reference_default = bool(
+            has_reference and slot_info.get("type") in {"lifestyle", "in_use"}
+        )
+        use_reference = st.checkbox(
+            "Use current slot image as inspiration",
+            value=use_reference_default,
+            key=f"cs_use_ref_img_{slot_num}",
+            disabled=not has_reference,
+            help=(
+                "Uses the currently stored slot image as a product reference for new generation. "
+                "Upload a product photo first if this slot is empty."
+            ),
+        )
 
         with btn_col1:
             if st.button(
@@ -1318,31 +2198,59 @@ def _render_image_slot(
                 use_container_width=True,
                 help="Generate with Google Imagen 3",
             ):
-                prompt = _build_image_prompt(slot_info, product_name, product_desc)
+                prompt = (prompt_text or "").strip() or _build_image_prompt(
+                    slot_info, product_name, product_desc
+                )
+                reference_image = (
+                    slot_data.get("image_bytes") if use_reference else None
+                )
                 with st.spinner(f"Generating {slot_info['name']}..."):
-                    img_bytes = _generate_image_with_imagen(prompt)
+                    img_bytes, used_reference = _generate_image_with_imagen(
+                        prompt,
+                        reference_image_bytes=reference_image,
+                        enforce_strict_spacing=True,
+                    )
 
                 if img_bytes:
+                    prompt_used = (
+                        f"{prompt}\n[reference_image:slot_{slot_num}]"
+                        if used_reference
+                        else prompt
+                    )
                     gallery[slot_num] = {
                         "image_bytes": img_bytes,
-                        "prompt_used": prompt,
-                        "model_used": IMAGEN_MODEL,
-                        "status": "generated",
+                        "prompt_used": prompt_used,
+                        "model_used": (
+                            f"{IMAGEN_MODEL}:recontext"
+                            if used_reference
+                            else IMAGEN_MODEL
+                        ),
+                        "status": (
+                            "generated_with_reference"
+                            if used_reference
+                            else "generated"
+                        ),
                     }
                     st.session_state["cs_image_gallery"] = gallery
                     _save_image_to_gallery(
                         launch_id,
                         slot_num,
                         slot_info["type"],
-                        prompt,
+                        prompt_used,
                         img_bytes,
-                        IMAGEN_MODEL,
+                        f"{IMAGEN_MODEL}:recontext" if used_reference else IMAGEN_MODEL,
                     )
-                    st.success(f"✅ {slot_info['name']} generated!")
+                    if used_reference:
+                        st.success(
+                            f"✅ {slot_info['name']} generated using your reference image!"
+                        )
+                    else:
+                        st.success(f"✅ {slot_info['name']} generated!")
                     st.rerun()
                 else:
                     st.warning(
-                        "⚠️ Image generation returned no result. Check credentials."
+                        "⚠️ Image generation returned no results. "
+                        "Verify Vertex AI access and service account permissions."
                     )
 
         with btn_col2:
@@ -1353,25 +2261,34 @@ def _render_image_slot(
                 label_visibility="collapsed",
             )
             if uploaded is not None:
-                img_bytes = uploaded.read()
-                gallery[slot_num] = {
-                    "image_bytes": img_bytes,
-                    "uploaded_file": img_bytes,
-                    "prompt_used": "manual_upload",
-                    "model_used": "upload",
-                    "status": "uploaded",
-                }
-                st.session_state["cs_image_gallery"] = gallery
-                _save_image_to_gallery(
-                    launch_id,
-                    slot_num,
-                    slot_info["type"],
-                    "manual_upload",
-                    img_bytes,
-                    "upload",
+                img_bytes = uploaded.getvalue()
+                fingerprint = hashlib.sha1(img_bytes).hexdigest()
+                uploaded_fingerprints = st.session_state.get(
+                    "cs_upload_fingerprints", {}
                 )
-                st.success(f"✅ {slot_info['name']} uploaded!")
-                st.rerun()
+                previous_fingerprint = uploaded_fingerprints.get(slot_num)
+
+                if previous_fingerprint != fingerprint:
+                    gallery[slot_num] = {
+                        "image_bytes": img_bytes,
+                        "uploaded_file": img_bytes,
+                        "prompt_used": "manual_upload",
+                        "model_used": "upload",
+                        "status": "uploaded",
+                    }
+                    st.session_state["cs_image_gallery"] = gallery
+                    uploaded_fingerprints[slot_num] = fingerprint
+                    st.session_state["cs_upload_fingerprints"] = uploaded_fingerprints
+                    _save_image_to_gallery(
+                        launch_id,
+                        slot_num,
+                        slot_info["type"],
+                        "manual_upload",
+                        img_bytes,
+                        "upload",
+                    )
+                    st.success(f"✅ {slot_info['name']} uploaded!")
+                    st.rerun()
 
 
 def _get_slot_requirements(slot_num: int) -> list[str]:
@@ -1421,6 +2338,434 @@ def _get_slot_requirements(slot_num: int) -> list[str]:
         ],
     }
     return requirements.get(slot_num, ["High quality product image"])
+
+
+def _infer_aspect_ratio(width: int, height: int) -> str:
+    ratio = width / max(1, height)
+    if ratio >= 2.0:
+        return "21:9"
+    if ratio >= 1.45:
+        return "16:9"
+    if ratio >= 1.2:
+        return "4:3"
+    if ratio <= 0.8:
+        return "3:4"
+    return "1:1"
+
+
+def _resize_cover(image_bytes: bytes, width: int, height: int) -> bytes | None:
+    try:
+        from PIL import Image
+    except Exception as exc:
+        logger.error("Pillow is required for A+ resizing: %s", exc)
+        return None
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            src_w, src_h = img.size
+            if src_w <= 0 or src_h <= 0:
+                return None
+
+            scale = max(width / src_w, height / src_h)
+            resized = img.resize(
+                (max(1, int(src_w * scale)), max(1, int(src_h * scale))),
+                Image.Resampling.LANCZOS,
+            )
+
+            left = max(0, (resized.width - width) // 2)
+            top = max(0, (resized.height - height) // 2)
+            cropped = resized.crop((left, top, left + width, top + height)).convert(
+                "RGB"
+            )
+
+            buf = io.BytesIO()
+            cropped.save(buf, format="JPEG", quality=95, optimize=True)
+            return buf.getvalue()
+    except Exception as exc:
+        logger.error("Failed to resize A+ image to %sx%s: %s", width, height, exc)
+        return None
+
+
+def _generate_aplus_copy(
+    product_name: str,
+    listing: dict[str, Any] | None,
+    brand_voice: str,
+) -> dict[str, Any] | None:
+    try:
+        genai = get_generative_client()
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        listing_payload = {
+            "title": (listing or {}).get("title", ""),
+            "bullets": (listing or {}).get("bullets", []),
+            "description": (listing or {}).get("description", ""),
+            "backend_keywords": (listing or {}).get("backend_keywords", ""),
+        }
+        prompt = f"""You are creating Amazon A+ Content copy and image prompts.
+
+Brand voice: {brand_voice}
+Product: {product_name}
+Listing context:
+{json.dumps(listing_payload, ensure_ascii=True)}
+
+Return STRICT JSON only in this schema:
+{{
+  "hero": {{"headline": "...", "body": "...", "image_prompt": "..."}},
+  "brand_story": {{"headline": "...", "body": "...", "image_prompt": "..."}},
+  "feature_tiles": [
+    {{"title": "...", "body": "...", "image_prompt": "..."}},
+    {{"title": "...", "body": "...", "image_prompt": "..."}},
+    {{"title": "...", "body": "...", "image_prompt": "..."}}
+  ],
+  "comparison": {{"title": "...", "body": "...", "image_prompt": "..."}}
+}}
+
+Rules:
+- Keep headlines short and punchy.
+- Keep each body under 220 characters.
+- Image prompts must describe realistic Amazon-safe product visuals.
+- Avoid medical/legal claims.
+"""
+        response = model.generate_content(prompt)
+        parsed = json.loads(
+            _strip_markdown_fences(str(getattr(response, "text", "") or ""))
+        )
+        if not isinstance(parsed, dict):
+            return None
+        return parsed
+    except Exception as exc:
+        logger.error("A+ copy generation failed: %s", exc)
+        return None
+
+
+def _build_aplus_image_prompts(aplus_copy: dict[str, Any]) -> dict[str, str]:
+    prompts: dict[str, str] = {}
+    hero = aplus_copy.get("hero", {}) if isinstance(aplus_copy, dict) else {}
+    story = aplus_copy.get("brand_story", {}) if isinstance(aplus_copy, dict) else {}
+    comparison = (
+        aplus_copy.get("comparison", {}) if isinstance(aplus_copy, dict) else {}
+    )
+    tiles = aplus_copy.get("feature_tiles", []) if isinstance(aplus_copy, dict) else []
+
+    prompts["hero_banner"] = str(
+        hero.get("image_prompt") or "Premium hero banner product photography."
+    )
+    prompts["brand_story"] = str(
+        story.get("image_prompt") or "Product story image with human context."
+    )
+    prompts["comparison"] = str(
+        comparison.get("image_prompt") or "Clean comparison visual for product."
+    )
+
+    for idx in range(3):
+        row = (
+            tiles[idx]
+            if isinstance(tiles, list)
+            and idx < len(tiles)
+            and isinstance(tiles[idx], dict)
+            else {}
+        )
+        prompts[f"feature_{idx + 1}"] = str(
+            row.get("image_prompt") or f"Feature tile {idx + 1} product image."
+        )
+    return prompts
+
+
+def _aplus_asset_signature(
+    launch_id: int,
+    asset_key: str,
+    prompt: str,
+    width: int,
+    height: int,
+    reference_bytes: bytes | None,
+    use_gallery_reference: bool,
+) -> str:
+    reference_hash = (
+        hashlib.sha1(reference_bytes).hexdigest() if reference_bytes else "no_reference"
+    )
+    payload = {
+        "launch_id": launch_id,
+        "asset_key": asset_key,
+        "prompt": prompt.strip(),
+        "width": width,
+        "height": height,
+        "aspect_ratio": _infer_aspect_ratio(width, height),
+        "reference_hash": reference_hash,
+        "use_gallery_reference": bool(use_gallery_reference),
+        "model": IMAGEN_MODEL,
+        "vertex_location": VERTEX_LOCATION,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
+def _render_aplus_engine(
+    launch: dict[str, Any], listing: dict[str, Any] | None
+) -> None:
+    st.subheader("🧩 A+ Content Studio")
+    st.caption(
+        "Generates Amazon-ready A+ copy + images using your listing and gallery images. "
+        "Assets are resized to Amazon module dimensions."
+    )
+
+    launch_id = int(launch["launch_id"])
+    gallery = st.session_state.get("cs_image_gallery", {})
+    product_name = (
+        st.session_state.get("cs_product_name")
+        or launch.get("product_description")
+        or "Product"
+    )
+
+    last_stats = st.session_state.get("cs_aplus_last_run_stats") or {}
+    if int(last_stats.get("launch_id") or -1) == launch_id:
+        quota_failures = int(last_stats.get("quota_limited_failures", 0))
+        cooldown_seconds = 60 if quota_failures > 0 else 0
+        ended_at = float(last_stats.get("ended_at_epoch") or 0.0)
+        remaining_seconds = max(
+            0, int(cooldown_seconds - max(0.0, time.time() - ended_at))
+        )
+
+        st.markdown("**Quota Dashboard**")
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Generated", int(last_stats.get("generated", 0)))
+        metric_cols[1].metric("Cached", int(last_stats.get("cached", 0)))
+        metric_cols[2].metric("Failed", int(last_stats.get("failed", 0)))
+        metric_cols[3].metric(
+            "Recommended wait",
+            f"{remaining_seconds}s" if remaining_seconds else "ready",
+        )
+        if quota_failures > 0 and remaining_seconds > 0:
+            st.info(
+                f"Quota throttling detected in last run ({quota_failures} failed requests). "
+                f"Recommended cooldown: ~{remaining_seconds}s before next full batch."
+            )
+
+    existing_package = st.session_state.get("cs_aplus_package") or {}
+    existing_assets = (
+        dict(existing_package.get("assets", {}))
+        if int(existing_package.get("launch_id") or -1) == launch_id
+        else {}
+    )
+
+    col_a1, col_a2, col_a3 = st.columns([2, 1, 1])
+    with col_a2:
+        use_gallery_reference = st.checkbox(
+            "Use slot images as references",
+            value=True,
+            key="cs_aplus_use_gallery_ref",
+            help="Uses existing slot images to preserve product consistency in generated A+ assets.",
+        )
+    with col_a3:
+        skip_cached_assets = st.checkbox(
+            "Reuse cached assets",
+            value=True,
+            key="cs_aplus_reuse_cached",
+            help="Skips API calls when prompt and dimensions have already been generated.",
+        )
+
+    selected_assets = st.multiselect(
+        "A+ image modules to generate",
+        options=list(APLUS_IMAGE_SPECS.keys()),
+        default=list(APLUS_IMAGE_SPECS.keys()),
+        key="cs_aplus_selected_assets",
+        format_func=lambda key: (
+            f"{key} ({APLUS_IMAGE_SPECS[key]['width']}x{APLUS_IMAGE_SPECS[key]['height']})"
+        ),
+        help="Generate only the assets you need right now to reduce quota bursts.",
+    )
+    preserve_unselected_assets = st.checkbox(
+        "Keep previously generated assets for unselected modules",
+        value=True,
+        key="cs_aplus_keep_unselected",
+    )
+
+    with col_a1:
+        if st.button(
+            "🚀 Generate A+ Package", type="primary", use_container_width=True
+        ):
+            if not selected_assets:
+                st.warning("Select at least one image module before generating.")
+                return
+
+            with st.spinner("Generating A+ copy and images..."):
+                st.session_state["cs_aplus_quota_hits_current_run"] = 0
+                aplus_copy = _generate_aplus_copy(
+                    product_name=product_name,
+                    listing=listing,
+                    brand_voice=st.session_state.get("cs_brand_voice", "Professional"),
+                )
+                if not aplus_copy:
+                    st.session_state.pop("cs_aplus_quota_hits_current_run", None)
+                    st.error("❌ A+ copy generation failed.")
+                    return
+
+                prompt_map = _build_aplus_image_prompts(aplus_copy)
+                assets: dict[str, dict[str, Any]] = (
+                    dict(existing_assets) if preserve_unselected_assets else {}
+                )
+                asset_cache = st.session_state.get("cs_aplus_asset_cache", {})
+
+                generated_count = 0
+                cached_count = 0
+                failed_count = 0
+
+                for asset_key, spec in APLUS_IMAGE_SPECS.items():
+                    if asset_key not in selected_assets:
+                        continue
+
+                    prompt = prompt_map.get(asset_key, "Professional product image")
+                    slot_ref = next(
+                        (
+                            data.get("image_bytes")
+                            for slot, data in gallery.items()
+                            if IMAGE_SLOTS.get(int(slot), {}).get("type")
+                            == spec["slot_type"]
+                            and data.get("image_bytes")
+                        ),
+                        None,
+                    )
+                    reference_bytes = slot_ref if use_gallery_reference else None
+                    cache_key = _aplus_asset_signature(
+                        launch_id=launch_id,
+                        asset_key=asset_key,
+                        prompt=prompt,
+                        width=spec["width"],
+                        height=spec["height"],
+                        reference_bytes=reference_bytes,
+                        use_gallery_reference=use_gallery_reference,
+                    )
+
+                    if skip_cached_assets and cache_key in asset_cache:
+                        cached_asset = dict(asset_cache[cache_key])
+                        cached_asset["cache_hit"] = True
+                        assets[asset_key] = cached_asset
+                        cached_count += 1
+                        continue
+
+                    raw_bytes, used_ref = _generate_image_with_imagen(
+                        prompt,
+                        reference_image_bytes=reference_bytes,
+                        aspect_ratio=_infer_aspect_ratio(spec["width"], spec["height"]),
+                    )
+                    if not raw_bytes:
+                        logger.warning("A+ asset generation failed for %s", asset_key)
+                        failed_count += 1
+                        continue
+
+                    final_bytes = _resize_cover(
+                        raw_bytes, spec["width"], spec["height"]
+                    )
+                    if not final_bytes:
+                        failed_count += 1
+                        continue
+
+                    asset_record = {
+                        "bytes": final_bytes,
+                        "width": spec["width"],
+                        "height": spec["height"],
+                        "prompt": prompt,
+                        "used_reference": used_ref,
+                        "cache_key": cache_key,
+                        "cache_hit": False,
+                    }
+                    assets[asset_key] = asset_record
+                    asset_cache[cache_key] = dict(asset_record)
+                    generated_count += 1
+
+                    if APLUS_IMAGE_CALL_SPACING_SECONDS > 0:
+                        time.sleep(APLUS_IMAGE_CALL_SPACING_SECONDS)
+
+                st.session_state["cs_aplus_asset_cache"] = asset_cache
+
+                quota_limited_failures = int(
+                    st.session_state.get("cs_aplus_quota_hits_current_run", 0)
+                )
+                st.session_state["cs_aplus_last_run_stats"] = {
+                    "launch_id": launch_id,
+                    "generated": generated_count,
+                    "cached": cached_count,
+                    "failed": failed_count,
+                    "quota_limited_failures": quota_limited_failures,
+                    "selected_assets": list(selected_assets),
+                    "ended_at_epoch": time.time(),
+                }
+                st.session_state.pop("cs_aplus_quota_hits_current_run", None)
+
+                package = {
+                    "launch_id": launch_id,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "copy": aplus_copy,
+                    "assets": assets,
+                }
+                st.session_state["cs_aplus_package"] = package
+
+                if listing is not None:
+                    listing["a_plus_content"] = {
+                        "copy": aplus_copy,
+                        "assets": {
+                            k: {
+                                "width": v["width"],
+                                "height": v["height"],
+                                "prompt": v["prompt"],
+                            }
+                            for k, v in assets.items()
+                        },
+                    }
+                    st.session_state["cs_edited_listing"] = listing
+
+            if generated_count:
+                st.success(
+                    f"✅ A+ package generated. New: {generated_count}, cached reuse: {cached_count}, failed: {failed_count}."
+                )
+            elif cached_count:
+                st.success(
+                    f"✅ A+ package ready from cache reuse ({cached_count} assets, {failed_count} failed)."
+                )
+            else:
+                st.warning("⚠️ A+ generation finished with no new assets.")
+            st.rerun()
+
+    package = st.session_state.get("cs_aplus_package")
+    if package and int(package.get("launch_id") or -1) != launch_id:
+        package = None
+    if not package:
+        st.info("Generate an A+ package to preview and download Amazon-ready assets.")
+        return
+
+    copy = package.get("copy", {})
+    assets = package.get("assets", {})
+
+    with st.expander("📄 A+ Copy", expanded=True):
+        st.json(copy)
+
+    if assets:
+        st.markdown("**A+ Image Assets**")
+        for asset_key, spec in APLUS_IMAGE_SPECS.items():
+            asset = assets.get(asset_key)
+            if not asset:
+                st.warning(f"⚠️ {asset_key}: generation missing")
+                continue
+            st.caption(f"{asset_key}: {spec['width']}x{spec['height']} px")
+            st.image(asset["bytes"], use_container_width=True)
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "a_plus_copy.json",
+                json.dumps(copy, ensure_ascii=True, indent=2),
+            )
+            for asset_key, asset in assets.items():
+                zf.writestr(
+                    f"{asset_key}_{asset['width']}x{asset['height']}.jpg",
+                    asset["bytes"],
+                )
+
+        st.download_button(
+            "⬇️ Download A+ Package (ZIP)",
+            data=zip_buf.getvalue(),
+            file_name=f"launch_{launch_id}_a_plus_package.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1556,7 +2901,7 @@ def _render_final_review(
     filled_slots = sum(
         1
         for s in range(1, 8)
-        if (s in gallery and gallery[s].get("image_bytes")) or s in db_gallery
+        if _slot_has_image(gallery.get(s)) or _slot_has_image(db_gallery.get(s))
     )
 
     # Validation checklist
@@ -1693,6 +3038,12 @@ def _render_final_review(
 # Main app
 # ---------------------------------------------------------------------------
 def main() -> None:
+    st.set_page_config(
+        page_title="Module 4: Creative Studio",
+        page_icon="🎨",
+        layout="wide",
+    )
+
     _init_session_state()
     _render_header()
 
@@ -1743,7 +3094,7 @@ def main() -> None:
                     st.error("❌ Please enter a Product Name.")
                 else:
                     with st.spinner("🤖 Generating optimized listing with Gemini..."):
-                        listing = _generate_listing(
+                        listing, policy_report = _generate_listing(
                             product_name=product_name,
                             key_features=st.session_state.get("cs_key_features", ""),
                             target_keywords=st.session_state.get(
@@ -1751,9 +3102,6 @@ def main() -> None:
                             ),
                             brand_voice=st.session_state.get(
                                 "cs_brand_voice", "Professional"
-                            ),
-                            include_aplus=st.session_state.get(
-                                "cs_include_aplus", False
                             ),
                             rufus_optimize=st.session_state.get(
                                 "cs_rufus_optimize", False
@@ -1763,6 +3111,9 @@ def main() -> None:
                     if listing:
                         st.session_state["cs_generated_listing"] = listing
                         st.session_state["cs_edited_listing"] = listing
+                        st.session_state["cs_listing_policy_report"] = (
+                            policy_report or {}
+                        )
                         st.success("✅ Listing generated!")
                         st.rerun()
 
@@ -1777,10 +3128,20 @@ def main() -> None:
             save_col, _ = st.columns([1, 3])
             with save_col:
                 if st.button("💾 Save Draft", use_container_width=True):
+                    listing_for_save = dict(edited)
+                    if st.session_state.get("cs_enforce_listing_policy", True):
+                        listing_for_save, policy_report = (
+                            _normalize_listing_with_policy(
+                                listing_for_save, active_marketplace
+                            )
+                        )
+                        st.session_state["cs_listing_policy_report"] = policy_report
+                        st.session_state["cs_generated_listing"] = listing_for_save
+                        st.session_state["cs_edited_listing"] = listing_for_save
                     success = _save_listing_draft(
                         launch_id=launch_id,
                         marketplace=active_marketplace,
-                        listing=edited,
+                        listing=listing_for_save,
                         rufus_optimized=st.session_state.get(
                             "cs_rufus_optimize", False
                         ),
@@ -1811,7 +3172,7 @@ def main() -> None:
                         st.error("❌ Set Product Name in the UK tab first.")
                     else:
                         with st.spinner(f"🤖 Generating {mp} listing..."):
-                            mp_listing = _generate_listing(
+                            mp_listing, policy_report = _generate_listing(
                                 product_name=product_name,
                                 key_features=st.session_state.get(
                                     "cs_key_features", ""
@@ -1822,9 +3183,6 @@ def main() -> None:
                                 brand_voice=st.session_state.get(
                                     "cs_brand_voice", "Professional"
                                 ),
-                                include_aplus=st.session_state.get(
-                                    "cs_include_aplus", False
-                                ),
                                 rufus_optimize=st.session_state.get(
                                     "cs_rufus_optimize", False
                                 ),
@@ -1832,6 +3190,9 @@ def main() -> None:
                             )
                         if mp_listing:
                             st.session_state[f"cs_listing_{mp}"] = mp_listing
+                            st.session_state["cs_listing_policy_report"] = (
+                                policy_report or {}
+                            )
                             st.success(f"✅ {mp} listing generated!")
                             st.rerun()
 
@@ -1845,10 +3206,17 @@ def main() -> None:
                         key=f"cs_save_{mp}",
                         use_container_width=True,
                     ):
+                        listing_for_save = dict(edited_mp)
+                        if st.session_state.get("cs_enforce_listing_policy", True):
+                            listing_for_save, policy_report = (
+                                _normalize_listing_with_policy(listing_for_save, mp)
+                            )
+                            st.session_state["cs_listing_policy_report"] = policy_report
+                            st.session_state[f"cs_listing_{mp}"] = listing_for_save
                         success = _save_listing_draft(
                             launch_id=launch_id,
                             marketplace=mp,
-                            listing=edited_mp,
+                            listing=listing_for_save,
                             rufus_optimized=st.session_state.get(
                                 "cs_rufus_optimize", False
                             ),
@@ -1859,8 +3227,27 @@ def main() -> None:
 
     st.divider()
 
-    # --- Image gallery ---
-    _render_image_gallery(selected_launch)
+    st.subheader("🧭 Creative Workspaces")
+    st.caption(
+        "Image generation and A+ package generation are now in dedicated pages for faster loads."
+    )
+    nav_col1, nav_col2 = st.columns(2)
+    with nav_col1:
+        st.page_link(
+            "pages/5_Creative_Images.py",
+            label="🖼️ Open Creative Images",
+            use_container_width=True,
+        )
+    with nav_col2:
+        st.page_link(
+            "pages/6_Aplus_Studio.py",
+            label="🧩 Open A+ Content Studio",
+            use_container_width=True,
+        )
+
+    current_listing = st.session_state.get("cs_edited_listing") or st.session_state.get(
+        "cs_generated_listing"
+    )
 
     st.divider()
 
@@ -1870,9 +3257,6 @@ def main() -> None:
     st.divider()
 
     # --- Final review ---
-    current_listing = st.session_state.get("cs_edited_listing") or st.session_state.get(
-        "cs_generated_listing"
-    )
     _render_final_review(selected_launch, current_listing)
 
 

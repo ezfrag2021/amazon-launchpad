@@ -474,20 +474,25 @@ def save_compliance_risk_assessment(
     with conn.cursor() as cur:
         cur.execute(
             """
-            DELETE FROM launchpad.risk_assessment
+            UPDATE launchpad.risk_assessment
+            SET risk_description = %s,
+                severity = %s,
+                mitigation = %s,
+                assessed_at = now()
             WHERE launch_id = %s
               AND risk_category = 'compliance_ai'
             """,
-            (launch_id,),
+            (summary, severity, payload, launch_id),
         )
-        cur.execute(
-            """
-            INSERT INTO launchpad.risk_assessment
-                (launch_id, risk_category, risk_description, severity, mitigation)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (launch_id, "compliance_ai", summary, severity, payload),
-        )
+        if cur.rowcount == 0:
+            cur.execute(
+                """
+                INSERT INTO launchpad.risk_assessment
+                    (launch_id, risk_category, risk_description, severity, mitigation)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (launch_id, "compliance_ai", summary, severity, payload),
+            )
     conn.commit()
 
 
@@ -1351,6 +1356,10 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
     st.markdown("Provide additional context for a more accurate risk analysis.")
 
     risk_key = f"cc_risk_assessment_{lid}"
+    risk_save_warning_key = f"cc_risk_assessment_save_warning_{lid}"
+    queued_warning = st.session_state.pop(risk_save_warning_key, None)
+    if queued_warning:
+        st.warning(str(queued_warning))
 
     if risk_key not in st.session_state:
         try:
@@ -1423,16 +1432,28 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
                     key_requirements=key_reqs,
                 )
                 if result:
-                    save_compliance_risk_assessment(
-                        conn,
-                        lid,
-                        result,
-                        intended_use=intended_use or "",
-                        materials=materials or "",
-                        selected_regimes=[str(r) for r in selected_regimes],
-                    )
                     st.session_state[risk_key] = result
-                    record_section_save(lid, "compliance", "risk_assessment")
+                    try:
+                        save_compliance_risk_assessment(
+                            conn,
+                            lid,
+                            result,
+                            intended_use=intended_use or "",
+                            materials=materials or "",
+                            selected_regimes=[str(r) for r in selected_regimes],
+                        )
+                        record_section_save(lid, "compliance", "risk_assessment")
+                    except psycopg.errors.InsufficientPrivilege as exc:
+                        conn.rollback()
+                        logger.warning(
+                            "Risk assessment generated but could not persist for launch %s: %s",
+                            lid,
+                            exc,
+                        )
+                        st.session_state[risk_save_warning_key] = (
+                            "Risk assessment generated but could not be saved to DB due "
+                            "table permissions. The result is available for this session."
+                        )
                     st.rerun()
                 else:
                     st.error(

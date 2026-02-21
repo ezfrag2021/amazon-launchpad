@@ -53,7 +53,56 @@ def get_connection() -> psycopg.Connection | None:
         return None
 
 
-conn = get_connection()
+def _safe_rollback(conn_obj: psycopg.Connection | None) -> None:
+    if conn_obj is None:
+        return
+    try:
+        conn_obj.rollback()
+    except Exception:
+        pass
+
+
+def _get_live_connection() -> psycopg.Connection | None:
+    """Return a healthy DB connection, refreshing cached one if needed."""
+    st.session_state["home_db_status"] = "checking"
+    conn_obj = get_connection()
+    if conn_obj is None:
+        st.session_state["home_db_status"] = "offline"
+        return None
+
+    try:
+        with conn_obj.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn_obj.commit()
+        st.session_state["home_db_status"] = "connected"
+        return conn_obj
+    except Exception:
+        _safe_rollback(conn_obj)
+        try:
+            conn_obj.close()
+        except Exception:
+            pass
+
+    st.session_state["home_db_status"] = "reconnecting"
+    get_connection.clear()
+    refreshed = get_connection()
+    if refreshed is None:
+        st.session_state["home_db_status"] = "offline"
+        return None
+
+    try:
+        with refreshed.cursor() as cur:
+            cur.execute("SELECT 1")
+        refreshed.commit()
+        st.session_state["home_db_status"] = "reconnected"
+        return refreshed
+    except Exception:
+        _safe_rollback(refreshed)
+        st.session_state["home_db_status"] = "offline"
+        return None
+
+
+conn = _get_live_connection()
 
 # ---------------------------------------------------------------------------
 # Sidebar navigation
@@ -62,6 +111,15 @@ with st.sidebar:
     st.title("Amazon Launchpad 🚀")
     st.markdown("---")
     st.caption("Amazon Launchpad v0.1")
+    sidebar_status = st.session_state.get("home_db_status", "unknown")
+    if conn is None or sidebar_status == "offline":
+        st.caption("DB: offline")
+    elif sidebar_status == "reconnected":
+        st.caption("DB: reconnected")
+    elif sidebar_status == "reconnecting":
+        st.caption("DB: reconnecting")
+    else:
+        st.caption("DB: connected")
 
 # ---------------------------------------------------------------------------
 # Helper: colour-coded pursuit category badge
@@ -106,6 +164,20 @@ def launch_label(launch: dict[str, object]) -> str:
     return custom_name if custom_name else "—"
 
 
+def render_db_status_caption(conn_obj: psycopg.Connection | None) -> None:
+    status = st.session_state.get("home_db_status", "unknown")
+    if conn_obj is None or status == "offline":
+        st.caption("DB: offline")
+        return
+    if status == "reconnected":
+        st.caption("DB: reconnected")
+        return
+    if status == "reconnecting":
+        st.caption("DB: reconnecting")
+        return
+    st.caption("DB: connected")
+
+
 # ---------------------------------------------------------------------------
 # Dashboard header
 # ---------------------------------------------------------------------------
@@ -114,6 +186,7 @@ st.markdown(
     "Evaluate, validate, and launch Amazon products across international marketplaces. "
     "Work across four modules: **Opportunity → Compliance → Pricing → Creative** in any order."
 )
+render_db_status_caption(conn)
 
 st.markdown("---")
 
@@ -146,7 +219,7 @@ if conn is not None:
 
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Could not load launch metrics: {exc}")
-        conn.rollback()
+        _safe_rollback(conn)
         all_launches = []
 else:
     all_launches = []
@@ -249,7 +322,7 @@ if st.session_state.get("show_create_form"):
                         st.session_state["selected_launch_id"] = launch_id
                         st.rerun()
                     except Exception as exc:  # noqa: BLE001
-                        conn.rollback()
+                        _safe_rollback(conn)
                         st.error(f"Failed to create launch: {exc}")
 
 # ---------------------------------------------------------------------------
@@ -477,5 +550,5 @@ else:
                             st.warning("Could not update archive status.")
 
             except Exception as exc:  # noqa: BLE001
-                conn.rollback()
+                _safe_rollback(conn)
                 st.error(f"Could not load launch details: {exc}")
