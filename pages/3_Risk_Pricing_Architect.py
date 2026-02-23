@@ -17,6 +17,7 @@ import psycopg
 import streamlit as st
 from dotenv import load_dotenv
 
+from services.bdl_theme import apply_bdl_theme, render_bdl_footer
 from services.db_connection import connect, resolve_dsn
 from services.js_client import JungleScoutClient
 from services.launch_state import STAGE_COMPLIANCE, STAGE_PRICING, LaunchStateManager
@@ -32,8 +33,8 @@ from services.workflow_ui import (
 # Page configuration — must be the first Streamlit call
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Module 3: Risk & Pricing Architect",
-    page_icon="💰",
+    page_title="Module 3: Risk & Pricing Architect | Bodhi & Digby",
+    page_icon="Logos/favicon.ico",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -42,6 +43,10 @@ st.set_page_config(
 # Environment & DB connection
 # ---------------------------------------------------------------------------
 load_dotenv()
+
+_theme_state = apply_bdl_theme(
+    "Model pricing, fees, PPC outcomes, and risks to choose a launch-ready strategy."
+)
 
 
 @st.cache_resource(show_spinner="Connecting to database…")
@@ -534,9 +539,18 @@ Context data:
             f"Last error: {last_error}"
         )
 
+    launch_name = str(snapshot.get("launch", {}).get("launch_name") or "").strip()
+    launch_id = snapshot.get("launch", {}).get("launch_id")
+    launch_title = (
+        f"Launch #{launch_id} - {launch_name}"
+        if launch_name
+        else f"Launch #{launch_id}"
+    )
     lines = [
-        f"# Opportunity Report - Launch #{snapshot['launch']['launch_id']}",
+        f"# Opportunity Report - {launch_title}",
         f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Source ASIN: {snapshot.get('launch', {}).get('source_asin') or 'N/A'}",
+        f"Source Marketplace: {snapshot.get('launch', {}).get('source_marketplace') or 'N/A'}",
         "",
     ]
     for key, heading in _REPORT_SECTIONS:
@@ -1052,41 +1066,194 @@ if calc_envelope or st.session_state.get("price_envelope"):
                     f"Break-even price: £{margin_detail['break_even_price']:.2f}"
                 )
 
-            # Price positioning chart
+            # Price positioning chart (market range + launch markers)
+            st.markdown("**Price Positioning**")
             try:
                 import altair as alt
                 import pandas as pd
 
-                price_points = pd.DataFrame(
-                    {
-                        "label": ["Floor", "Recommended", "Ceiling"],
-                        "price": [
-                            envelope["price_floor"],
-                            envelope["recommended_launch_price"],
-                            envelope["price_ceiling"],
-                        ],
-                        "color": ["#FF4B4B", "#21C354", "#FF9900"],
-                    }
+                sorted_prices = sorted(float(p) for p in prices_for_envelope)
+                n = len(sorted_prices)
+                p50 = sorted_prices[n // 2]
+                p25 = sorted_prices[max(0, int(n * 0.25) - 1)]
+                p75 = sorted_prices[min(n - 1, int(n * 0.75))]
+                pmin = sorted_prices[0]
+                pmax = sorted_prices[-1]
+
+                floor_v = float(envelope["price_floor"])
+                rec_v = float(envelope["recommended_launch_price"])
+                ceil_v = float(envelope["price_ceiling"])
+                break_even_v = float(margin_detail["break_even_price"])
+
+                segments_df = pd.DataFrame(
+                    [
+                        {
+                            "row": "Competitor Market",
+                            "x0": pmin,
+                            "x1": pmax,
+                            "band": "Range",
+                        },
+                        {
+                            "row": "Competitor Market",
+                            "x0": p25,
+                            "x1": p75,
+                            "band": "IQR",
+                        },
+                    ]
+                )
+                markers_df = pd.DataFrame(
+                    [
+                        {
+                            "row": "Competitor Market",
+                            "label": "Median",
+                            "price": p50,
+                            "kind": "Median",
+                        },
+                        {
+                            "row": "Your Pricing",
+                            "label": "Floor",
+                            "price": floor_v,
+                            "kind": "Floor",
+                        },
+                        {
+                            "row": "Your Pricing",
+                            "label": "Recommended",
+                            "price": rec_v,
+                            "kind": "Recommended",
+                        },
+                        {
+                            "row": "Your Pricing",
+                            "label": "Ceiling",
+                            "price": ceil_v,
+                            "kind": "Ceiling",
+                        },
+                        {
+                            "row": "Your Pricing",
+                            "label": "Break-even",
+                            "price": break_even_v,
+                            "kind": "Break-even",
+                        },
+                    ]
+                )
+
+                base = alt.Chart().encode(
+                    y=alt.Y(
+                        "row:N",
+                        title=None,
+                        sort=["Competitor Market", "Your Pricing"],
+                    )
+                )
+
+                range_line = (
+                    base.mark_rule(strokeWidth=5, color="#9AA4B2")
+                    .encode(
+                        x="x0:Q",
+                        x2="x1:Q",
+                    )
+                    .transform_filter(alt.datum.band == "Range")
+                )
+                iqr_line = (
+                    base.mark_rule(strokeWidth=12, color="#4B6CB7")
+                    .encode(
+                        x="x0:Q",
+                        x2="x1:Q",
+                    )
+                    .transform_filter(alt.datum.band == "IQR")
+                )
+
+                markers = (
+                    alt.Chart(markers_df)
+                    .mark_point(filled=True, size=120)
+                    .encode(
+                        x=alt.X("price:Q", title="Price (£)"),
+                        y=alt.Y(
+                            "row:N",
+                            title=None,
+                            sort=["Competitor Market", "Your Pricing"],
+                        ),
+                        color=alt.Color(
+                            "kind:N",
+                            scale=alt.Scale(
+                                domain=[
+                                    "Floor",
+                                    "Recommended",
+                                    "Ceiling",
+                                    "Break-even",
+                                    "Median",
+                                ],
+                                range=[
+                                    "#FF4B4B",
+                                    "#21C354",
+                                    "#FF9900",
+                                    "#6B7280",
+                                    "#1f2937",
+                                ],
+                            ),
+                            legend=alt.Legend(title="Markers"),
+                        ),
+                        shape=alt.Shape(
+                            "kind:N",
+                            scale=alt.Scale(
+                                domain=[
+                                    "Floor",
+                                    "Recommended",
+                                    "Ceiling",
+                                    "Break-even",
+                                    "Median",
+                                ],
+                                range=[
+                                    "circle",
+                                    "diamond",
+                                    "circle",
+                                    "triangle-up",
+                                    "square",
+                                ],
+                            ),
+                            legend=None,
+                        ),
+                        tooltip=["label:N", alt.Tooltip("price:Q", format=".2f")],
+                    )
+                )
+
+                labels = (
+                    alt.Chart(markers_df)
+                    .mark_text(align="left", dx=6, dy=-8, color="#4B5563")
+                    .encode(
+                        x="price:Q",
+                        y=alt.Y(
+                            "row:N",
+                            sort=["Competitor Market", "Your Pricing"],
+                            title=None,
+                        ),
+                        text="label:N",
+                    )
                 )
 
                 chart = (
-                    alt.Chart(price_points)
-                    .mark_bar(size=40)
-                    .encode(
-                        x=alt.X(
-                            "label:N",
-                            title="Price Point",
-                            sort=["Floor", "Recommended", "Ceiling"],
-                        ),
-                        y=alt.Y("price:Q", title="Price (£)"),
-                        color=alt.Color("color:N", scale=None, legend=None),
-                        tooltip=["label:N", alt.Tooltip("price:Q", format="£.2f")],
+                    alt.layer(
+                        range_line,
+                        iqr_line,
+                        markers,
+                        labels,
+                        data=segments_df,
                     )
-                    .properties(title="Price Positioning", height=200)
+                    .properties(height=220)
+                    .resolve_scale(color="independent", shape="independent")
                 )
+
                 st.altair_chart(chart, use_container_width=True)
-            except ImportError:
-                pass
+                st.caption(
+                    "Reads left-to-right by price: grey line is full competitor range, blue band is the middle market (P25-P75), black diamond is median, and colored markers are your floor/recommended/ceiling plus break-even."
+                )
+            except Exception as chart_exc:  # noqa: BLE001
+                st.warning(f"Could not render advanced positioning chart: {chart_exc}")
+                st.bar_chart(
+                    {
+                        "Floor": [float(envelope["price_floor"])],
+                        "Recommended": [float(envelope["recommended_launch_price"])],
+                        "Ceiling": [float(envelope["price_ceiling"])],
+                    }
+                )
 
             # Viability assessment
             viability = engine.assess_price_viability(
@@ -1822,3 +1989,5 @@ try:
 except Exception:  # noqa: BLE001
     conn.rollback()
     st.caption("Could not load saved pricing status.")
+
+render_bdl_footer(_theme_state)

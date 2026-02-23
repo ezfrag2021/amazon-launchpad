@@ -10,7 +10,10 @@ from __future__ import annotations
 import logging
 import os
 import json
+import hashlib
+import csv
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -19,8 +22,15 @@ from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
 from services.compliance_engine import ComplianceEngine
+from services.bdl_theme import apply_bdl_theme, render_bdl_footer
 from services.compliance_profile import ProductProfile
 from services.db_connection import connect, resolve_dsn
+from services.ingredient_compliance import (
+    evaluate_screening,
+    load_rule_map,
+    normalize_ingredient_name,
+    overall_status as ingredient_overall_status,
+)
 from services.launch_state import STAGE_COMPLIANCE, LaunchStateManager
 from services.product_profiler import infer_product_profile
 from services.workflow_ui import (
@@ -33,13 +43,17 @@ from services.workflow_ui import (
 # Page configuration — must be the first Streamlit call
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Module 2: Compliance Compass",
-    page_icon="🧭",
+    page_title="Module 2: Compliance Compass | Bodhi & Digby",
+    page_icon="Logos/favicon.ico",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 load_dotenv()
+
+_theme_state = apply_bdl_theme(
+    "Map EU/UK compliance requirements and track checklist completion before Stage 3."
+)
 
 # ---------------------------------------------------------------------------
 # Regime display config
@@ -264,6 +278,258 @@ _REGIME_PACKAGING_INFO: dict[str, list[str]] = {
     ],
 }
 
+
+def _init_ingredient_screening_state(lid: int, selected_regimes: list[str]) -> None:
+    allowed_jurisdictions = [r for r in selected_regimes if r in ("EU", "UK")]
+    default_jurisdictions = allowed_jurisdictions or ["EU", "UK"]
+    defaults: dict[str, Any] = {
+        f"cc_ing_ctx_{lid}": {
+            "product_type": "cosmetic",
+            "product_category": "leave_on_cosmetic",
+            "jurisdictions": default_jurisdictions,
+            "product_subtype": "",
+        },
+        f"cc_ing_raw_{lid}": "",
+        f"cc_ing_findings_{lid}": [],
+        f"cc_ing_warnings_{lid}": [],
+        f"cc_ing_overall_{lid}": None,
+        f"cc_ing_run_meta_{lid}": {},
+        f"cc_ing_last_hash_{lid}": None,
+        f"cc_ing_findings_accepted_{lid}": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _ingredient_input_hash(lid: int) -> str:
+    payload = {
+        "ctx": st.session_state.get(f"cc_ing_ctx_{lid}", {}),
+        "raw": st.session_state.get(f"cc_ing_raw_{lid}", ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _confidence_from_prevalence(obf_count: int, source2_count: int) -> str:
+    if obf_count > 0 and source2_count > 0:
+        return "high"
+    if obf_count > 0 or source2_count > 0:
+        return "medium"
+    return "low"
+
+
+@st.cache_data(show_spinner=False)
+def _load_multisource_watchlist() -> dict[str, dict[str, Any]]:
+    base = Path(__file__).resolve().parents[1] / "EU_Compliance" / "derived"
+    files = [
+        (base / "top100_restricted_reranked_multisource.csv", "restricted"),
+        (base / "top100_prohibited_reranked_multisource.csv", "prohibited"),
+    ]
+
+    by_name: dict[str, dict[str, Any]] = {}
+    for file_path, watchlist_class in files:
+        if not file_path.exists():
+            continue
+
+        with file_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                name = normalize_ingredient_name(str(row.get("name") or ""))
+                if not name:
+                    continue
+
+                try:
+                    score = float(str(row.get("combined_commonness_score") or "0") or 0)
+                except ValueError:
+                    score = 0.0
+
+                try:
+                    obf_count = int(
+                        str(row.get("commonness_products_count") or "0") or 0
+                    )
+                except ValueError:
+                    obf_count = 0
+
+                try:
+                    source2_count = int(
+                        str(row.get("source2_products_count") or "0") or 0
+                    )
+                except ValueError:
+                    source2_count = 0
+
+                current = by_name.get(name)
+                if current and float(current.get("combined_score", 0.0)) >= score:
+                    continue
+
+                by_name[name] = {
+                    "watchlist_class": watchlist_class,
+                    "combined_score": score,
+                    "obf_count": obf_count,
+                    "source2_count": source2_count,
+                    "confidence": _confidence_from_prevalence(obf_count, source2_count),
+                }
+
+    return by_name
+
+
+def _enrich_findings_with_watchlist(
+    findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    watchlist = _load_multisource_watchlist()
+    enriched: list[dict[str, Any]] = []
+
+    for finding in findings:
+        row = dict(finding)
+        matched = str(row.get("Matched") or "")
+        normalized = normalize_ingredient_name(matched)
+        details = watchlist.get(normalized)
+
+        if details:
+            row["Watchlist"] = str(details["watchlist_class"])
+            row["MatchConfidence"] = str(details["confidence"])
+            row["PrevalenceScore"] = f"{float(details['combined_score']):.3f}"
+        else:
+            is_unknown = str(row.get("Outcome") or "") in (
+                "unknown",
+                "missing_concentration",
+                "no_specific_rule",
+            )
+            row["Watchlist"] = "unlisted"
+            row["MatchConfidence"] = "low" if is_unknown else "medium"
+            row["PrevalenceScore"] = "0.000"
+
+        enriched.append(row)
+
+    return enriched
+
+
+def _run_ingredient_screening(conn: psycopg.Connection, lid: int) -> None:
+    raw_text = str(st.session_state.get(f"cc_ing_raw_{lid}", ""))
+    ctx = st.session_state.get(f"cc_ing_ctx_{lid}", {})
+    jurisdictions = [j for j in ctx.get("jurisdictions", []) if j in ("EU", "UK")]
+
+    product_category = str(ctx.get("product_category") or "all")
+    product_subtype = str(ctx.get("product_subtype") or "")
+    rules_map, used_fallback = load_rule_map(
+        conn,
+        jurisdictions=jurisdictions,
+        product_category=product_category,
+        product_subtype=product_subtype,
+    )
+    findings, warnings = evaluate_screening(
+        raw_text=raw_text,
+        jurisdictions=jurisdictions,
+        rules=rules_map,
+    )
+    findings = _enrich_findings_with_watchlist(findings)
+    if used_fallback:
+        warnings.append(
+            "No database ingredient rules matched this context; fallback sample rules were used."
+        )
+
+    st.session_state[f"cc_ing_findings_{lid}"] = findings
+    st.session_state[f"cc_ing_warnings_{lid}"] = sorted(set(warnings))
+    st.session_state[f"cc_ing_overall_{lid}"] = ingredient_overall_status(findings)
+    st.session_state[f"cc_ing_last_hash_{lid}"] = _ingredient_input_hash(lid)
+    st.session_state[f"cc_ing_findings_accepted_{lid}"] = False
+    rule_version = "db-rules" if not used_fallback else "fallback-sample"
+    st.session_state[f"cc_ing_run_meta_{lid}"] = {
+        "run_id": datetime.utcnow().strftime("ING-%Y%m%d-%H%M%S"),
+        "run_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "rule_version": rule_version,
+    }
+
+    payload = {
+        "saved_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "context": st.session_state.get(f"cc_ing_ctx_{lid}", {}),
+        "raw": st.session_state.get(f"cc_ing_raw_{lid}", ""),
+        "findings": st.session_state.get(f"cc_ing_findings_{lid}", []),
+        "warnings": st.session_state.get(f"cc_ing_warnings_{lid}", []),
+        "overall_status": st.session_state.get(f"cc_ing_overall_{lid}"),
+        "run_meta": st.session_state.get(f"cc_ing_run_meta_{lid}", {}),
+        "accepted": bool(
+            st.session_state.get(f"cc_ing_findings_accepted_{lid}", False)
+        ),
+    }
+
+    try:
+        save_ingredient_screening(conn, lid, payload)
+        record_section_save(lid, "compliance", "ingredient_screening")
+    except psycopg.errors.InsufficientPrivilege as exc:
+        conn.rollback()
+        logger.warning(
+            "Ingredient screening generated but could not persist for launch %s: %s",
+            lid,
+            exc,
+        )
+        st.session_state[f"cc_ing_save_warning_{lid}"] = (
+            "Ingredient screening generated but could not be saved to DB due table "
+            "permissions. The result is available for this session."
+        )
+
+
+def _ingredient_findings_stale(lid: int) -> bool:
+    findings = st.session_state.get(f"cc_ing_findings_{lid}", [])
+    if not findings:
+        return False
+    last_hash = st.session_state.get(f"cc_ing_last_hash_{lid}")
+    return bool(last_hash and last_hash != _ingredient_input_hash(lid))
+
+
+def _render_ingredient_status_banner(lid: int) -> None:
+    overall = st.session_state.get(f"cc_ing_overall_{lid}")
+    if overall == "fail":
+        st.error("Overall ingredient screening result: FAIL")
+    elif overall == "manual_review":
+        st.warning("Overall ingredient screening result: MANUAL REVIEW")
+    elif overall == "conditional":
+        st.info("Overall ingredient screening result: CONDITIONAL")
+    elif overall == "pass":
+        st.success("Overall ingredient screening result: PASS")
+
+
+def _build_ingredient_risk_context(lid: int) -> dict[str, Any]:
+    findings = st.session_state.get(f"cc_ing_findings_{lid}", [])
+    counts = {
+        "prohibited_or_exceeds": 0,
+        "missing_concentration": 0,
+        "restricted_conditionally": 0,
+        "no_specific_or_unknown": 0,
+    }
+    examples: list[str] = []
+
+    for row in findings:
+        if not isinstance(row, dict):
+            continue
+        outcome = str(row.get("Outcome") or "")
+        matched = str(row.get("Matched") or row.get("Input") or "Unknown")
+        jurisdiction = str(row.get("Jurisdiction") or "")
+        example = f"{jurisdiction}: {matched} -> {outcome}".strip()
+
+        if outcome in ("prohibited", "exceeds_limit"):
+            counts["prohibited_or_exceeds"] += 1
+            if len(examples) < 8:
+                examples.append(example)
+        elif outcome == "missing_concentration":
+            counts["missing_concentration"] += 1
+            if len(examples) < 8:
+                examples.append(example)
+        elif outcome == "restricted_conditionally":
+            counts["restricted_conditionally"] += 1
+            if len(examples) < 8:
+                examples.append(example)
+        elif outcome in ("no_specific_rule", "unknown"):
+            counts["no_specific_or_unknown"] += 1
+
+    return {
+        "overall": str(st.session_state.get(f"cc_ing_overall_{lid}") or "not_run"),
+        "counts": counts,
+        "examples": examples,
+    }
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -452,12 +718,16 @@ def save_compliance_risk_assessment(
     intended_use: str,
     materials: str,
     selected_regimes: list[str],
+    gmp_assured: bool,
+    ingredient_context: dict[str, Any],
 ) -> None:
     payload_assessment = dict(assessment)
     payload_assessment["_context"] = {
         "intended_use": intended_use,
         "materials": materials,
         "selected_regimes": selected_regimes,
+        "gmp_assured": gmp_assured,
+        "ingredient_context": ingredient_context,
     }
 
     level = str(assessment.get("overall_risk_level") or "medium").strip().lower()
@@ -492,6 +762,79 @@ def save_compliance_risk_assessment(
                 VALUES (%s, %s, %s, %s, %s)
                 """,
                 (launch_id, "compliance_ai", summary, severity, payload),
+            )
+    conn.commit()
+
+
+def load_saved_ingredient_screening(
+    conn: psycopg.Connection, launch_id: int
+) -> dict[str, Any] | None:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT mitigation
+            FROM launchpad.risk_assessment
+            WHERE launch_id = %s
+              AND risk_category = 'ingredient_screening'
+            ORDER BY assessed_at DESC
+            LIMIT 1
+            """,
+            (launch_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    raw_payload = row.get("mitigation")
+    if not raw_payload:
+        return None
+
+    try:
+        parsed = json.loads(str(raw_payload))
+    except Exception:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def save_ingredient_screening(
+    conn: psycopg.Connection,
+    launch_id: int,
+    payload: dict[str, Any],
+) -> None:
+    overall = str(payload.get("overall_status") or "manual_review").strip().lower()
+    severity_map = {
+        "pass": "Low",
+        "conditional": "Medium",
+        "manual_review": "Medium",
+        "fail": "High",
+    }
+    summary = f"Ingredient screening result: {overall.upper()}"
+    severity = severity_map.get(overall, "Medium")
+    packed = json.dumps(payload, ensure_ascii=True)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE launchpad.risk_assessment
+            SET risk_description = %s,
+                severity = %s,
+                mitigation = %s,
+                assessed_at = now()
+            WHERE launch_id = %s
+              AND risk_category = 'ingredient_screening'
+            """,
+            (summary, severity, packed, launch_id),
+        )
+        if cur.rowcount == 0:
+            cur.execute(
+                """
+                INSERT INTO launchpad.risk_assessment
+                    (launch_id, risk_category, risk_description, severity, mitigation)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (launch_id, "ingredient_screening", summary, severity, packed),
             )
     conn.commit()
 
@@ -1223,6 +1566,8 @@ if category_locked and not active_profile:
 if category_locked and profile_confirmed and regimes_confirmed and selected_regimes:
     active_category = st.session_state.get(val_key, db_category)
 
+    _init_ingredient_screening_state(lid, selected_regimes)
+
     # Use profile if available, else category string
     product_scope = active_profile if active_profile else active_category
 
@@ -1230,6 +1575,340 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
     regime_filtered_rules = [
         r for r in matched_rules if r.get("regime") in selected_regimes
     ]
+
+    st.markdown("---")
+    st.subheader("🧪 Step 2.5: Ingredient-Level Screening")
+    render_section_save_status(lid, "compliance", "ingredient_screening")
+    st.caption(
+        "Pilot ingredient checker for EU/UK limits. This is a preliminary screen and "
+        "does not replace specialist legal review."
+    )
+
+    ing_ctx_key = f"cc_ing_ctx_{lid}"
+    ing_raw_key = f"cc_ing_raw_{lid}"
+    ing_findings_key = f"cc_ing_findings_{lid}"
+    ing_warnings_key = f"cc_ing_warnings_{lid}"
+    ing_accepted_key = f"cc_ing_findings_accepted_{lid}"
+    ing_run_meta_key = f"cc_ing_run_meta_{lid}"
+    ing_loaded_key = f"cc_ing_loaded_{lid}"
+    ing_save_warning_key = f"cc_ing_save_warning_{lid}"
+
+    queued_ing_warning = st.session_state.pop(ing_save_warning_key, None)
+    if queued_ing_warning:
+        st.warning(str(queued_ing_warning))
+
+    if not bool(st.session_state.get(ing_loaded_key, False)):
+        try:
+            persisted_ing = load_saved_ingredient_screening(conn, lid)
+            conn.commit()
+            if isinstance(persisted_ing, dict):
+                st.session_state[ing_ctx_key] = persisted_ing.get(
+                    "context"
+                ) or st.session_state.get(ing_ctx_key, {})
+                st.session_state[ing_raw_key] = str(persisted_ing.get("raw") or "")
+                st.session_state[ing_findings_key] = persisted_ing.get("findings") or []
+                st.session_state[ing_warnings_key] = persisted_ing.get("warnings") or []
+                st.session_state[f"cc_ing_overall_{lid}"] = persisted_ing.get(
+                    "overall_status"
+                )
+                st.session_state[ing_run_meta_key] = persisted_ing.get("run_meta") or {}
+                st.session_state[ing_accepted_key] = bool(
+                    persisted_ing.get("accepted", False)
+                )
+                st.session_state[f"cc_ing_last_hash_{lid}"] = _ingredient_input_hash(
+                    lid
+                )
+        except Exception:
+            conn.rollback()
+        finally:
+            st.session_state[ing_loaded_key] = True
+
+    ing_tabs = st.tabs(["Context", "Ingredients", "Findings", "Report"])
+
+    with ing_tabs[0]:
+        left_col, right_col = st.columns(2)
+        ctx = st.session_state[ing_ctx_key]
+        with left_col:
+            ctx["product_type"] = st.selectbox(
+                "Product Type",
+                options=["cosmetic", "chemical", "general"],
+                index=["cosmetic", "chemical", "general"].index(
+                    str(ctx.get("product_type") or "cosmetic")
+                ),
+                key=f"cc_ing_product_type_{lid}",
+            )
+            category_options = ["leave_on_cosmetic", "rinse_off_cosmetic", "general"]
+            current_category = str(ctx.get("product_category") or "leave_on_cosmetic")
+            category_idx = (
+                category_options.index(current_category)
+                if current_category in category_options
+                else 0
+            )
+            ctx["product_category"] = st.selectbox(
+                "Product Category",
+                options=category_options,
+                index=category_idx,
+                key=f"cc_ing_product_category_{lid}",
+            )
+
+        with right_col:
+            default_jurisdictions = [
+                j for j in ctx.get("jurisdictions", []) if j in ("EU", "UK")
+            ]
+            ctx["jurisdictions"] = st.multiselect(
+                "Jurisdictions",
+                options=["EU", "UK"],
+                default=default_jurisdictions,
+                key=f"cc_ing_jurisdictions_{lid}",
+            )
+            ctx["product_subtype"] = st.text_input(
+                "Product Subtype (optional)",
+                value=str(ctx.get("product_subtype") or ""),
+                placeholder="e.g. face care",
+                key=f"cc_ing_product_subtype_{lid}",
+            )
+
+        st.session_state[ing_ctx_key] = ctx
+
+    with ing_tabs[1]:
+        st.session_state[ing_raw_key] = st.text_area(
+            "Paste Ingredients",
+            value=str(st.session_state.get(ing_raw_key, "")),
+            placeholder=(
+                "One ingredient per line. Examples:\n"
+                "Salicylic Acid 2% w/w\n"
+                "Phenoxyethanol 0.8% w/w"
+            ),
+            height=180,
+            key=f"cc_ing_input_{lid}",
+        )
+
+        run_check_col, clear_col = st.columns([2, 1])
+        with run_check_col:
+            if st.button(
+                "Run Ingredient Check",
+                type="primary",
+                use_container_width=True,
+                key=f"cc_run_ing_check_{lid}",
+            ):
+                current_ctx = st.session_state.get(ing_ctx_key, {})
+                jurisdictions = current_ctx.get("jurisdictions", [])
+                if not jurisdictions:
+                    st.error("Select at least one jurisdiction in the Context tab.")
+                elif not str(st.session_state.get(ing_raw_key, "")).strip():
+                    st.error("Enter at least one ingredient before running the check.")
+                else:
+                    _run_ingredient_screening(conn, lid)
+                    st.success("Ingredient screening complete.")
+
+        with clear_col:
+            if st.button(
+                "Clear",
+                use_container_width=True,
+                key=f"cc_clear_ing_{lid}",
+            ):
+                st.session_state[ing_raw_key] = ""
+                st.session_state[ing_findings_key] = []
+                st.session_state[ing_warnings_key] = []
+                st.session_state[ing_accepted_key] = False
+                st.session_state[f"cc_ing_overall_{lid}"] = None
+                st.session_state[ing_run_meta_key] = {}
+                st.session_state[f"cc_ing_last_hash_{lid}"] = None
+                try:
+                    save_ingredient_screening(
+                        conn,
+                        lid,
+                        {
+                            "saved_at_utc": datetime.utcnow().strftime(
+                                "%Y-%m-%d %H:%M:%S UTC"
+                            ),
+                            "context": st.session_state.get(ing_ctx_key, {}),
+                            "raw": "",
+                            "findings": [],
+                            "warnings": [],
+                            "overall_status": None,
+                            "run_meta": {},
+                            "accepted": False,
+                        },
+                    )
+                    record_section_save(lid, "compliance", "ingredient_screening")
+                except psycopg.errors.InsufficientPrivilege:
+                    conn.rollback()
+                st.rerun()
+
+        if _ingredient_findings_stale(lid):
+            st.warning(
+                "Inputs have changed since the last run. Findings are stale until you run again."
+            )
+
+    with ing_tabs[2]:
+        findings = st.session_state.get(ing_findings_key, [])
+        warnings = st.session_state.get(ing_warnings_key, [])
+        run_meta = st.session_state.get(ing_run_meta_key, {})
+
+        if not findings:
+            st.info(
+                "Run ingredient screening in the Ingredients tab to populate findings."
+            )
+        else:
+            if _ingredient_findings_stale(lid):
+                st.warning(
+                    "Findings shown are from a previous run. Re-run to refresh this report."
+                )
+
+            _render_ingredient_status_banner(lid)
+            st.caption(
+                "MatchConfidence blends rule mapping with prevalence evidence from Open Beauty Facts + INCIDecoder watchlists."
+            )
+            if run_meta:
+                st.caption(
+                    f"Run: {run_meta.get('run_id', 'N/A')} | "
+                    f"At: {run_meta.get('run_at_utc', 'N/A')} | "
+                    f"Rule set: {run_meta.get('rule_version', 'N/A')}"
+                )
+
+            if warnings:
+                with st.expander("Parsing and mapping warnings", expanded=True):
+                    for warning_text in warnings:
+                        st.markdown(f"- {warning_text}")
+
+            filter_choice = st.selectbox(
+                "Filter Findings",
+                options=["All", "Exceeds/Prohibited", "Restricted", "Unknown"],
+                key=f"cc_ing_filter_{lid}",
+            )
+            filtered_findings = findings
+            if filter_choice == "Exceeds/Prohibited":
+                filtered_findings = [
+                    f
+                    for f in findings
+                    if f.get("Outcome") in ("exceeds_limit", "prohibited")
+                ]
+            elif filter_choice == "Restricted":
+                filtered_findings = [
+                    f
+                    for f in findings
+                    if f.get("Outcome") == "restricted_conditionally"
+                ]
+            elif filter_choice == "Unknown":
+                filtered_findings = [
+                    f
+                    for f in findings
+                    if f.get("Outcome") in ("unknown", "missing_concentration")
+                ]
+
+            st.dataframe(filtered_findings, use_container_width=True, hide_index=True)
+
+            st.session_state[ing_accepted_key] = st.checkbox(
+                "I reviewed these findings and want to continue to report.",
+                value=bool(st.session_state.get(ing_accepted_key, False)),
+                key=f"cc_ing_accept_{lid}",
+            )
+
+    with ing_tabs[3]:
+        findings = st.session_state.get(ing_findings_key, [])
+        accepted = bool(st.session_state.get(ing_accepted_key, False))
+        is_stale = _ingredient_findings_stale(lid)
+        run_meta = st.session_state.get(ing_run_meta_key, {})
+
+        if not findings:
+            st.info("No screening run yet. Complete Context and Ingredients first.")
+        elif is_stale:
+            st.warning(
+                "Findings are stale. Re-run ingredient check before finalizing report."
+            )
+        elif not accepted:
+            st.info(
+                "Accept findings in the Findings tab to enable report finalization."
+            )
+        else:
+            disposition = st.selectbox(
+                "Final Disposition",
+                options=["Pass", "Conditional", "Manual Review", "Fail"],
+                index=2,
+                key=f"cc_ing_report_disposition_{lid}",
+            )
+            reviewer_note = st.text_area(
+                "Reviewer Note",
+                placeholder="Required for Manual Review and Fail",
+                key=f"cc_ing_report_note_{lid}",
+            )
+
+            if st.button(
+                "Finalize Ingredient Report",
+                type="primary",
+                key=f"cc_finalize_ing_report_{lid}",
+            ):
+                if (
+                    disposition in ("Manual Review", "Fail")
+                    and not reviewer_note.strip()
+                ):
+                    st.error("Reviewer note is required for Manual Review or Fail.")
+                else:
+                    st.success("Ingredient report finalized for this session.")
+
+            export_payload = {
+                "run_meta": run_meta,
+                "context": st.session_state.get(ing_ctx_key, {}),
+                "overall_status": st.session_state.get(f"cc_ing_overall_{lid}"),
+                "findings": findings,
+                "warnings": st.session_state.get(ing_warnings_key, []),
+                "disposition": disposition,
+                "reviewer_note": reviewer_note,
+            }
+
+            export_col1, export_col2 = st.columns(2)
+            with export_col1:
+                st.download_button(
+                    "Export Ingredient Report (JSON)",
+                    data=json.dumps(export_payload, indent=2, ensure_ascii=True),
+                    file_name=f"ingredient_screening_launch_{lid}.json",
+                    mime="application/json",
+                    key=f"cc_ing_export_json_{lid}",
+                    use_container_width=True,
+                )
+            with export_col2:
+                csv_rows = [
+                    {
+                        "jurisdiction": row.get("Jurisdiction"),
+                        "input": row.get("Input"),
+                        "matched": row.get("Matched"),
+                        "submitted": row.get("Submitted"),
+                        "outcome": row.get("Outcome"),
+                        "limit": row.get("Limit"),
+                        "action": row.get("Action"),
+                        "source": row.get("Source"),
+                    }
+                    for row in findings
+                ]
+                csv_text = "\n".join(
+                    [
+                        "jurisdiction,input,matched,submitted,outcome,limit,action,source",
+                        *[
+                            ",".join(
+                                [
+                                    json.dumps(str(r.get("jurisdiction") or "")),
+                                    json.dumps(str(r.get("input") or "")),
+                                    json.dumps(str(r.get("matched") or "")),
+                                    json.dumps(str(r.get("submitted") or "")),
+                                    json.dumps(str(r.get("outcome") or "")),
+                                    json.dumps(str(r.get("limit") or "")),
+                                    json.dumps(str(r.get("action") or "")),
+                                    json.dumps(str(r.get("source") or "")),
+                                ]
+                            )
+                            for r in csv_rows
+                        ],
+                    ]
+                )
+                st.download_button(
+                    "Export Ingredient Findings (CSV)",
+                    data=csv_text,
+                    file_name=f"ingredient_findings_launch_{lid}.csv",
+                    mime="text/csv",
+                    key=f"cc_ing_export_csv_{lid}",
+                    use_container_width=True,
+                )
 
     # --- Step 3: Requirements & Packaging ---
     st.markdown("---")
@@ -1384,6 +2063,10 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
                         st.session_state[f"cc_selected_regimes_{lid}"] = [
                             str(r) for r in context.get("selected_regimes", []) if r
                         ]
+                    if f"cc_gmp_assured_{lid}" not in st.session_state:
+                        st.session_state[f"cc_gmp_assured_{lid}"] = bool(
+                            context.get("gmp_assured", True)
+                        )
         except Exception:
             conn.rollback()
 
@@ -1406,6 +2089,16 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
             key=f"cc_mat_input_{lid}",
         )
         st.session_state[f"cc_materials_{lid}"] = materials
+
+    gmp_assured = st.checkbox(
+        "Assume product is manufactured in a GMP-controlled facility",
+        value=bool(st.session_state.get(f"cc_gmp_assured_{lid}", True)),
+        key=f"cc_gmp_assured_{lid}",
+    )
+
+    ingredient_context = _build_ingredient_risk_context(lid)
+    with st.expander("Ingredient signal used in AI risk context", expanded=False):
+        st.json(ingredient_context)
 
     cached_assessment = st.session_state.get(risk_key)
     btn_label = "🔄 Regenerate" if cached_assessment else "🤖 Generate Risk Assessment"
@@ -1430,6 +2123,8 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
                     materials=materials or "",
                     selected_regimes=selected_regimes,
                     key_requirements=key_reqs,
+                    ingredient_context=ingredient_context,
+                    gmp_assured=gmp_assured,
                 )
                 if result:
                     st.session_state[risk_key] = result
@@ -1441,6 +2136,8 @@ if category_locked and profile_confirmed and regimes_confirmed and selected_regi
                             intended_use=intended_use or "",
                             materials=materials or "",
                             selected_regimes=[str(r) for r in selected_regimes],
+                            gmp_assured=gmp_assured,
+                            ingredient_context=ingredient_context,
                         )
                         record_section_save(lid, "compliance", "risk_assessment")
                     except psycopg.errors.InsufficientPrivilege as exc:
@@ -1909,13 +2606,37 @@ if existing_checklist:
                     )
 
                     if upload_doc_clicked:
-                        uploaded = upload_markdown_gdoc_to_launch_audit_folder(
-                            report_text=report_text,
-                            file_name=report_filename,
-                            root_folder_id=drive_folder_id,
-                            launch_id=lid,
-                            source_asin=str(selected_launch.get("source_asin") or ""),
-                        )
+                        try:
+                            uploaded = upload_markdown_gdoc_to_launch_audit_folder(
+                                report_text=report_text,
+                                file_name=report_filename,
+                                root_folder_id=drive_folder_id,
+                                launch_id=lid,
+                                source_asin=str(
+                                    selected_launch.get("source_asin") or ""
+                                ),
+                            )
+                        except Exception as doc_exc:
+                            if "internal" in str(doc_exc).lower() or "500" in str(
+                                doc_exc
+                            ):
+                                st.warning(
+                                    "Google Docs conversion hit a transient Drive error. "
+                                    "Saved Markdown instead."
+                                )
+                                uploaded = (
+                                    upload_markdown_report_to_launch_audit_folder(
+                                        report_text=report_text,
+                                        file_name=report_filename,
+                                        root_folder_id=drive_folder_id,
+                                        launch_id=lid,
+                                        source_asin=str(
+                                            selected_launch.get("source_asin") or ""
+                                        ),
+                                    )
+                                )
+                            else:
+                                raise
                     else:
                         uploaded = upload_markdown_report_to_launch_audit_folder(
                             report_text=report_text,
@@ -2044,3 +2765,5 @@ else:
         "📋 No compliance checklist yet. "
         "Complete the steps above and click **Generate Checklist**."
     )
+
+render_bdl_footer(_theme_state)

@@ -1,25 +1,20 @@
-# Session Continuation Prompt
+# Session Prompt
 
-## Completed
-- **Migration 008**: Cache-first evolution applied successfully
-- **JS Client**: Cache-first Jungle Scout client implemented in `services/js_client.py`
-- **Tests**: 7 unit tests passing in `tests/test_js_client_cache.py`
-- **Schema**: Updated with `request_key` column for cache tracking
-- **Deployment**: All 9 steps complete, OPS_MANIFEST.sh marked COMPLETE
+## What changed
+- Implemented Stage 2 Compliance Compass 4-step wizard in `pages/2_Compliance_Compass.py` (category lock/reset, regime confirm, requirements + packaging summaries, AI risk assessment, regime-scoped checklist generation).
+- Added Gemini-based risk assessment service in `services/compliance_risk_assessment.py` using `services/auth_manager.py`.
 
-## Current State
-- Git: 3 commits ahead of origin, 8 new files staged
-- Tests: All passing (7/7)
-- No blockers
+## Key behavior
+- Regime inference is based on `compliance_rules.category_pattern` regex matching; regimes are derived from matched rules.
+- Cosmetics/REACH/GPSR are currently tagged as `regime: CE` in `scripts/seed_compliance_rules.py`, so they do not appear as separate regimes.
 
-## Next Steps (User Options)
-1. **Commit & Push**: `git add . && git commit -m "Migration 008: Cache-first JS client"` then push
-2. **Test Integration**: Run full test suite or manual app testing
-3. **Deploy**: Execute deployment steps if ready
-4. **Review**: Check `services/js_client.py` and migration SQL for final approval
+## Verification
+- Streamlit ran on `http://localhost:8510` with no-sandbox Playwright fallback (root environment).
+- Stage 2 flow and AI risk assessment rendered successfully during validation.
 
-## Key Files
-- `services/js_client.py` - Cache-first implementation
-- `migrations/008_cache_evolution.sql` - Applied migration
-- `tests/test_js_client_cache.py` - Test suite
-- `OPS_MANIFEST.sh` - Deployment manifest
+## User request in progress
+- User wants a **scope-driven compliance decision engine** based on directive/regulation applicability (not keyword patches). Proposed approach: structured product profile + deterministic scope rules, Gemini optional for profile inference.
+
+## Important notes
+- Playwright MCP fails under root without `--no-sandbox`.
+- `google.generativeai` is deprecated; warning appears in Streamlit logs but functionality works.

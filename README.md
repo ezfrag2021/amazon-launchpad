@@ -84,6 +84,20 @@ done
 python scripts/seed_compliance_rules.py
 ```
 
+### 4b) Import ingredient-level compliance data (optional, new)
+
+Use the CSV templates and import script:
+
+```bash
+cp scripts/templates/ingredients_template.csv /tmp/ingredients.csv
+cp scripts/templates/compliance_rules_template.csv /tmp/compliance_rules.csv
+python scripts/import_ingredient_compliance_data.py \
+  --ingredients-csv /tmp/ingredients.csv \
+  --rules-csv /tmp/compliance_rules.csv
+```
+
+Run `migrations/014_ingredient_compliance_rules.sql` first.
+
 ### 5) Start the app
 
 ```bash

@@ -7,6 +7,8 @@
 | **review_moat_analysis** | moat_id (PK), launch_id (FK), marketplace, competitor_count, avg_review_count, avg_rating, review_velocity_30d, moat_strength | Per-marketplace analysis; UNIQUE(launch_id, marketplace) |
 | **compliance_rules** | rule_id (PK), regime, category_pattern, requirement_name, documentation_required[], is_2026_dpp_relevant | Reference data; seeded by seed_compliance_rules.py |
 | **launch_compliance_checklist** | checklist_id (PK), launch_id (FK), rule_id (FK), status, evidence_url | Junction table; UNIQUE(launch_id, rule_id) |
+| **ingredient_registry** | ingredient_id (PK), canonical_name, normalized_name, cas_number, synonyms[] | Canonical ingredient dictionary for concentration checks |
+| **ingredient_compliance_rules** | ingredient_rule_id (PK), ingredient_id (FK), jurisdiction, product_category, rule_type, max_concentration | EU/UK ingredient-level thresholds/restrictions with citations |
 | **pricing_analysis** | pricing_id (PK), launch_id (FK), marketplace, recommended_launch_price, price_floor, price_ceiling, margin_estimate_pct | UNIQUE(launch_id, marketplace) |
 | **ppc_simulation** | sim_id (PK), launch_id (FK), marketplace, keyword, search_volume_exact, estimated_cpc, estimated_acos_pct | Per-keyword estimates; UNIQUE(launch_id, marketplace, keyword) |
 | **risk_assessment** | risk_id (PK), launch_id (FK), risk_category, risk_description, severity, mitigation | 5 categories: safety, fragility, IP, compliance, market |

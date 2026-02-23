@@ -1,0 +1,22 @@
+# Commonness Re-ranking Method
+
+- Primary prevalence source: Open Beauty Facts ingredient facets (`commonness_products_count`).
+- Secondary prevalence source: INCIDecoder ingredient pages (`https://incidecoder.com/ingredients/<slug>`).
+- Secondary metric extraction: estimated product count via pagination depth.
+- How INCIDecoder count is estimated:
+  - count product links (`/products/...`) on each ingredient page (50 links per full page)
+  - binary search highest `uoffset` page that still has product links
+  - compute total as `last_offset*50 + last_page_count` (or `(last_offset+1)*50` if full last page)
+- Name matching variants: base name, alias split (`;`/`/`), stereochemistry stripped, `Salts of` stripped, bracket-stripped form.
+- Guardrails: generic one-token variants are ignored.
+- Combined score:
+  - `combined_commonness_score = 0.65*ln(1+obf_count) + 0.35*ln(1+incidecoder_count_capped)`
+  - `incidecoder_count_capped = min(incidecoder_count, 50000)` to prevent long-tail pagination outliers from dominating rank
+- Confidence band:
+  - `match_confidence = high` when both sources are non-zero
+  - `match_confidence = medium` when only one source is non-zero
+  - `match_confidence = low` when both sources are zero
+- Output files:
+  - `EU_Compliance/derived/top100_restricted_reranked_multisource.csv`
+  - `EU_Compliance/derived/top100_prohibited_reranked_multisource.csv`
+- Interpretation: higher score = more common label occurrence across both sources; not legal severity.

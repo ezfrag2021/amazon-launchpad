@@ -1,0 +1,3 @@
+jurisdiction,product_category,product_subtype,ingredient_lookup_kind,ingredient_lookup_value,rule_type,max_value,max_unit,basis,condition_text,exceptions_text,source_title,source_url,source_clause,effective_from,effective_to,rule_version,last_reviewed_at,status
+EU,leave_on_cosmetic,,cas_number,69-72-7,max_concentration,2.0,% w/w,w/w,Maximum concentration in final product,,EU Cosmetics Annex Example,https://example.org/eu/annex,Entry X,2025-01-01,,1.0,2026-02-01,active
+UK,leave_on_cosmetic,,cas_number,69-72-7,max_concentration,2.0,% w/w,w/w,Maximum concentration in final product,,UK Cosmetics Schedule Example,https://example.org/uk/schedule,Entry Y,2025-01-01,,1.0,2026-02-01,active

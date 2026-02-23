@@ -22,6 +22,8 @@ def assess_compliance_risks(
     materials: str,
     selected_regimes: list[str],
     key_requirements: list[str],
+    ingredient_context: dict[str, Any] | None = None,
+    gmp_assured: bool = False,
 ) -> dict[str, Any] | None:
     """Generate an AI-powered compliance risk assessment.
 
@@ -34,6 +36,8 @@ def assess_compliance_risks(
         materials: Key materials and components.
         selected_regimes: Regime codes (CE, UKCA, etc.).
         key_requirements: Requirement names from selected regimes.
+        ingredient_context: Ingredient screening summary/context.
+        gmp_assured: Whether manufacturing is assumed GMP-controlled.
 
     Returns:
         Dict with structure::
@@ -48,19 +52,28 @@ def assess_compliance_risks(
     try:
         from services.auth_manager import get_generative_client
     except ImportError:
-        logger.warning("auth_manager not available for risk assessment; using heuristic fallback")
+        logger.warning(
+            "auth_manager not available for risk assessment; using heuristic fallback"
+        )
         return _build_fallback_assessment(
             product_category=product_category,
             intended_use=intended_use,
             materials=materials,
             selected_regimes=selected_regimes,
             key_requirements=key_requirements,
+            ingredient_context=ingredient_context,
+            gmp_assured=gmp_assured,
             reason="Gemini auth module unavailable",
         )
 
     prompt = _build_risk_prompt(
-        product_category, intended_use, materials,
-        selected_regimes, key_requirements,
+        product_category,
+        intended_use,
+        materials,
+        selected_regimes,
+        key_requirements,
+        ingredient_context,
+        gmp_assured,
     )
 
     raw = ""
@@ -74,7 +87,10 @@ def assess_compliance_risks(
             lines = raw.split("\n")
             raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise json.JSONDecodeError("Top-level payload is not an object", raw, 0)
+        return _apply_contextual_adjustments(parsed, ingredient_context, gmp_assured)
     except json.JSONDecodeError as exc:
         logger.error("Risk assessment JSON parse error: %s\nRaw: %s", exc, raw[:500])
         return _build_fallback_assessment(
@@ -83,6 +99,8 @@ def assess_compliance_risks(
             materials=materials,
             selected_regimes=selected_regimes,
             key_requirements=key_requirements,
+            ingredient_context=ingredient_context,
+            gmp_assured=gmp_assured,
             reason="Gemini returned non-JSON payload",
         )
     except FileNotFoundError as exc:
@@ -93,6 +111,8 @@ def assess_compliance_risks(
             materials=materials,
             selected_regimes=selected_regimes,
             key_requirements=key_requirements,
+            ingredient_context=ingredient_context,
+            gmp_assured=gmp_assured,
             reason="Gemini credentials missing",
         )
     except ImportError as exc:
@@ -103,6 +123,8 @@ def assess_compliance_risks(
             materials=materials,
             selected_regimes=selected_regimes,
             key_requirements=key_requirements,
+            ingredient_context=ingredient_context,
+            gmp_assured=gmp_assured,
             reason="Gemini dependency missing",
         )
     except Exception as exc:
@@ -113,6 +135,8 @@ def assess_compliance_risks(
             materials=materials,
             selected_regimes=selected_regimes,
             key_requirements=key_requirements,
+            ingredient_context=ingredient_context,
+            gmp_assured=gmp_assured,
             reason="Gemini request failed",
         )
 
@@ -123,6 +147,8 @@ def _build_fallback_assessment(
     materials: str,
     selected_regimes: list[str],
     key_requirements: list[str],
+    ingredient_context: dict[str, Any] | None,
+    gmp_assured: bool,
     reason: str,
 ) -> dict[str, Any]:
     """Return deterministic, non-AI risk assessment for offline testing."""
@@ -196,7 +222,10 @@ def _build_fallback_assessment(
                 "risk_name": "Toy safety labeling and testing mismatch",
                 "severity": "high",
                 "description": "Age grading, warning text, and EN 71 test scope can be inconsistent across listing and packaging.",
-                "regime_references": ["ToyEN71", "CE" if "CE" in regime_set else "ToyEN71"],
+                "regime_references": [
+                    "ToyEN71",
+                    "CE" if "CE" in regime_set else "ToyEN71",
+                ],
                 "mitigations": [
                     "Map hazards to EN 71 parts and validate warnings for the intended age group.",
                     "Align product detail page claims with tested use-case and packaging warnings.",
@@ -222,9 +251,13 @@ def _build_fallback_assessment(
         risks.append(
             {
                 "risk_name": "Battery transport and safety controls",
-                "severity": "critical" if "toy" in category_text or "children" in use_text else "high",
+                "severity": "critical"
+                if "toy" in category_text or "children" in use_text
+                else "high",
                 "description": "Battery-powered products have elevated safety and logistics risks if test and handling controls are incomplete.",
-                "regime_references": [r for r in ("CE", "RoHS", "WEEE", "ToyEN71") if r in regime_set],
+                "regime_references": [
+                    r for r in ("CE", "RoHS", "WEEE", "ToyEN71") if r in regime_set
+                ],
                 "mitigations": [
                     "Validate battery safety documentation and transport classification before shipment.",
                     "Implement supplier lot traceability and incoming inspection for battery assemblies.",
@@ -246,10 +279,30 @@ def _build_fallback_assessment(
             }
         )
 
-    severity_rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-    overall = max(risks, key=lambda r: severity_rank.get(r.get("severity", "low"), 1)).get("severity", "medium")
+    ingredient_context = ingredient_context or {}
+    ingredient_overall = str(ingredient_context.get("overall") or "").lower()
+    if gmp_assured and ingredient_overall in ("pass", "conditional"):
+        risks.append(
+            {
+                "risk_name": "Ingredient controls require periodic refresh",
+                "severity": "low",
+                "description": "Ingredient screen passed under current GMP assumption; maintain periodic evidence updates as formulas or suppliers change.",
+                "regime_references": [r for r in ("EU", "UK") if r in regime_set]
+                or regimes,
+                "mitigations": [
+                    "Re-run ingredient check on formulation changes and keep supplier CoA/SDS records.",
+                    "Schedule recurring compliance review of concentration-limited substances.",
+                ],
+            }
+        )
 
-    requirements_sample = ", ".join(key_requirements[:3]) if key_requirements else "selected regime requirements"
+    overall = _derive_overall_risk(risks)
+
+    requirements_sample = (
+        ", ".join(key_requirements[:3])
+        if key_requirements
+        else "selected regime requirements"
+    )
     summary = (
         f"Heuristic risk assessment generated because {reason}. "
         f"For category '{product_category or 'Unspecified'}', primary risk concentration is '{overall}'. "
@@ -276,6 +329,8 @@ def _build_risk_prompt(
     materials: str,
     selected_regimes: list[str],
     key_requirements: list[str],
+    ingredient_context: dict[str, Any] | None,
+    gmp_assured: bool,
 ) -> str:
 
     regimes_str = ", ".join(selected_regimes) if selected_regimes else "None specified"
@@ -284,16 +339,37 @@ def _build_risk_prompt(
         if key_requirements
         else "None specified"
     )
+    ingredient_context = ingredient_context or {}
+    ingredient_overall = str(ingredient_context.get("overall") or "not_run")
+    ingredient_counts = ingredient_context.get("counts") or {}
+    ingredient_lines = [
+        f"- overall: {ingredient_overall}",
+        f"- prohibited_or_exceeds: {int(ingredient_counts.get('prohibited_or_exceeds', 0) or 0)}",
+        f"- missing_concentration: {int(ingredient_counts.get('missing_concentration', 0) or 0)}",
+        f"- restricted_conditionally: {int(ingredient_counts.get('restricted_conditionally', 0) or 0)}",
+        f"- no_specific_rule_or_unknown: {int(ingredient_counts.get('no_specific_or_unknown', 0) or 0)}",
+    ]
+    ingredient_examples = ingredient_context.get("examples") or []
+    if isinstance(ingredient_examples, list):
+        for item in ingredient_examples[:8]:
+            ingredient_lines.append(f"- {str(item)}")
+    ingredient_block = "\n".join(ingredient_lines)
+    gmp_text = "Yes" if gmp_assured else "No / Unknown"
 
     return f"""You are an expert EU/UK product compliance consultant. Analyse the following product \
 and identify compliance risks with specific mitigations referencing the applicable regulatory regimes.
 
 PRODUCT CATEGORY: {product_category}
-INTENDED USE: {intended_use or 'Not specified'}
-KEY MATERIALS/COMPONENTS: {materials or 'Not specified'}
+INTENDED USE: {intended_use or "Not specified"}
+KEY MATERIALS/COMPONENTS: {materials or "Not specified"}
 APPLICABLE REGIMES: {regimes_str}
 KEY REQUIREMENTS:
 {reqs_str}
+
+ASSUMED GMP-CONTROLLED MANUFACTURING FACILITY: {gmp_text}
+
+INGREDIENT SCREENING CONTEXT (from internal checker):
+{ingredient_block}
 
 OUTPUT FORMAT (respond with valid JSON only, no markdown code blocks):
 {{
@@ -323,5 +399,76 @@ RULES:
 high (potential market access risk), critical (safety/legal liability).
 - Focus on real-world risks: chemical restrictions, safety testing, marking requirements, \
 documentation gaps, DPP readiness, and supply chain compliance.
+- Use ingredient screening context as a primary signal for ingredient/formulation risk.
+- If ingredient screening has no prohibited/exceeds findings and GMP assumption is Yes, do NOT assign high/critical risk solely for generic GMP or generic ingredient uncertainty.
+- If missing concentration exists for concentration-limited ingredients, include that as at least medium risk.
 - Do NOT include markdown code blocks in response, return raw JSON only.
 """
+
+
+def _derive_overall_risk(risks: list[dict[str, Any]]) -> str:
+    severity_rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+    return (
+        max(
+            risks,
+            key=lambda r: severity_rank.get(str(r.get("severity") or "low"), 1),
+        ).get("severity", "medium")
+        if risks
+        else "medium"
+    )
+
+
+def _cap_severity(current: str, cap: str) -> str:
+    order = ["low", "medium", "high", "critical"]
+    current_norm = current if current in order else "medium"
+    cap_norm = cap if cap in order else "critical"
+    return order[min(order.index(current_norm), order.index(cap_norm))]
+
+
+def _apply_contextual_adjustments(
+    assessment: dict[str, Any],
+    ingredient_context: dict[str, Any] | None,
+    gmp_assured: bool,
+) -> dict[str, Any]:
+    context = ingredient_context or {}
+    counts = context.get("counts") or {}
+    has_hard_ingredient_fail = int(counts.get("prohibited_or_exceeds", 0) or 0) > 0
+    has_missing_conc = int(counts.get("missing_concentration", 0) or 0) > 0
+
+    risks = assessment.get("risks")
+    if not isinstance(risks, list):
+        risks = []
+
+    for risk in risks:
+        if not isinstance(risk, dict):
+            continue
+        name_desc = (
+            f"{str(risk.get('risk_name') or '')} {str(risk.get('description') or '')}"
+        ).lower()
+        severity = str(risk.get("severity") or "medium").lower()
+
+        is_gmp_theme = ("gmp" in name_desc) or ("good manufacturing" in name_desc)
+        is_ingredient_theme = any(
+            token in name_desc
+            for token in (
+                "ingredient",
+                "formulation",
+                "concentration",
+                "prohibited",
+                "annex",
+                "inci",
+            )
+        )
+
+        if gmp_assured and is_gmp_theme:
+            risk["severity"] = _cap_severity(severity, "low")
+
+        if is_ingredient_theme and gmp_assured and not has_hard_ingredient_fail:
+            cap = "medium" if has_missing_conc else "low"
+            risk["severity"] = _cap_severity(
+                str(risk.get("severity") or "medium").lower(), cap
+            )
+
+    assessment["risks"] = risks
+    assessment["overall_risk_level"] = _derive_overall_risk(risks)
+    return assessment
