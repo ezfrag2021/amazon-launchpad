@@ -21,6 +21,7 @@ from services.bdl_theme import apply_bdl_theme, render_bdl_footer
 from services.db_connection import connect, resolve_dsn
 from services.js_client import JungleScoutClient
 from services.launch_state import STAGE_COMPLIANCE, STAGE_PRICING, LaunchStateManager
+from services.opportunity_economics import build_economic_estimate_from_snapshot
 from services.pricing_engine import PricingEngine
 from services.sp_api_fees import estimate_competitor_fees
 from services.workflow_ui import (
@@ -390,6 +391,7 @@ def _collect_report_snapshot(
     price_envelope: dict[str, Any] | None,
     ppc_simulation: list[dict[str, Any]],
     risks: dict[str, dict[str, Any]],
+    economic_inputs: dict[str, Any] | None,
 ) -> dict[str, Any]:
     launch_id = int(launch_row["launch_id"])
     snapshot: dict[str, Any] = {
@@ -431,6 +433,7 @@ def _collect_report_snapshot(
             ),
         },
         "risk_assessments": risks,
+        "economic_opportunity_inputs": economic_inputs or {},
     }
 
     with conn.cursor() as cur:
@@ -468,6 +471,18 @@ def _collect_report_snapshot(
         )
         draft_row = cur.fetchone()
 
+        cur.execute(
+            """
+            SELECT competitor_count, avg_review_count, avg_rating, review_velocity_30d, moat_strength
+            FROM launchpad.review_moat_analysis
+            WHERE launch_id = %s AND marketplace = %s
+            ORDER BY analyzed_at DESC
+            LIMIT 1
+            """,
+            (launch_id, marketplace_code),
+        )
+        moat_row = cur.fetchone()
+
     snapshot["compliance_summary"] = checklist_counts
     snapshot["latest_saved_pricing"] = (
         {
@@ -485,7 +500,78 @@ def _collect_report_snapshot(
         "listing_draft_count": int(draft_row[0]) if draft_row else 0,
         "latest_draft_at": str(draft_row[1]) if draft_row and draft_row[1] else None,
     }
+
+    snapshot["review_moat_summary"] = (
+        {
+            "competitor_count": int(moat_row[0] or 0),
+            "avg_review_count": float(moat_row[1] or 0),
+            "avg_rating": float(moat_row[2] or 0),
+            "review_velocity_30d": float(moat_row[3] or 0),
+            "moat_strength": str(moat_row[4] or ""),
+        }
+        if moat_row
+        else {}
+    )
+
+    try:
+        input_market_value = float(
+            (economic_inputs or {}).get("target_market_value_monthly") or 0
+        )
+    except (TypeError, ValueError):
+        input_market_value = 0.0
+    try:
+        source_share_pct = float(
+            (economic_inputs or {}).get("source_share_assumption_pct") or 10.0
+        )
+    except (TypeError, ValueError):
+        source_share_pct = 10.0
+
+    if input_market_value > 0:
+        snapshot["economic_opportunity_estimate"] = (
+            build_economic_estimate_from_snapshot(
+                snapshot,
+                target_market_value_monthly=input_market_value,
+                source_share_assumption_pct=source_share_pct,
+            )
+        )
+    else:
+        snapshot["economic_opportunity_estimate"] = {
+            "note": (
+                "Economic opportunity estimate skipped because target_market_value_monthly "
+                "was not provided."
+            )
+        }
     return snapshot
+
+
+def _estimate_market_value_from_session_competitors(
+    marketplace_code: str,
+) -> float | None:
+    """Best-effort market value estimate from Stage 1 competitor session data."""
+    rows = st.session_state.get("competitor_data")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    total = 0.0
+    matched = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("marketplace") or "").upper() != str(marketplace_code).upper():
+            continue
+        try:
+            price = float(row.get("price") or 0)
+            units = float(row.get("monthly_sales") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or units <= 0:
+            continue
+        total += price * units
+        matched += 1
+
+    if matched == 0 or total <= 0:
+        return None
+    return round(total, 2)
 
 
 def _generate_opportunity_report_markdown(snapshot: dict[str, Any]) -> str:
@@ -1889,6 +1975,77 @@ report_folder_id = (
 )
 st.caption("Drive path: `Launch_<id>_<ASIN>/Opportunity_Reports/<YYYY-MM-DD>/`")
 
+estimated_market_value = _estimate_market_value_from_session_competitors(marketplace)
+if estimated_market_value is not None:
+    st.caption(
+        f"Auto-estimated {marketplace} market value from cached Stage 1 competitors: "
+        f"~{estimated_market_value:,.0f}."
+    )
+    st.caption("No additional API calls are made for this estimate.")
+
+source_share_analysis_raw = st.session_state.get("source_market_share_analysis")
+source_share_analysis: dict[str, Any] = (
+    source_share_analysis_raw if isinstance(source_share_analysis_raw, dict) else {}
+)
+measured_source_share_pct: float | None = None
+raw_share = source_share_analysis.get("value_share_pct")
+if raw_share is None:
+    raw_share = source_share_analysis.get("unit_share_pct")
+if source_share_analysis and not bool(source_share_analysis.get("is_reliable", True)):
+    raw_share = None
+try:
+    measured_source_share_pct = float(raw_share) if raw_share is not None else None
+except (TypeError, ValueError):
+    measured_source_share_pct = None
+
+if measured_source_share_pct is not None:
+    basis = (
+        "value share"
+        if source_share_analysis.get("value_share_pct") is not None
+        else "unit share"
+    )
+    source_market = str(source_share_analysis.get("source_marketplace") or "US")
+    st.caption(
+        f"Using measured source-market share from Module 1 ({source_market}, {basis}): "
+        f"{measured_source_share_pct:.2f}%."
+    )
+
+econ_col1, econ_col2 = st.columns(2)
+with econ_col1:
+    target_market_value_monthly = st.number_input(
+        f"Estimated {marketplace} market value / month",
+        min_value=0.0,
+        max_value=100_000_000.0,
+        value=float(estimated_market_value or 100_000.0),
+        step=1000.0,
+        format="%.2f",
+        help=(
+            "Used for report economics. If Stage 1 data is present we prefill from cached "
+            "competitor sales x price without extra API calls."
+        ),
+    )
+
+with econ_col2:
+    source_share_assumption_pct = st.number_input(
+        "Source marketplace share (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(measured_source_share_pct or 10.0),
+        step=0.5,
+        format="%.1f",
+        help=(
+            "Used for transfer-adjusted forecasting. Defaults to measured Module 1 "
+            "share when available, otherwise 10%."
+        ),
+    )
+
+economic_inputs = {
+    "target_market_value_monthly": float(target_market_value_monthly),
+    "source_share_assumption_pct": float(source_share_assumption_pct),
+    "estimated_from_stage1_competitors": bool(estimated_market_value is not None),
+    "measured_source_share_available": bool(measured_source_share_pct is not None),
+}
+
 report_col1, report_col2 = st.columns([2, 3])
 with report_col1:
     generate_report = st.button(
@@ -1914,6 +2071,7 @@ if generate_report:
             price_envelope=st.session_state.get("price_envelope"),
             ppc_simulation=st.session_state.get("ppc_simulation", []),
             risks=risk_assessments,
+            economic_inputs=economic_inputs,
         )
 
         with st.spinner("Drafting structured opportunity report with Gemini…"):
