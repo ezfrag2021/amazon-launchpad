@@ -40,7 +40,10 @@ from services.imagen_quota import (
     mark_imagen_request_attempt as quota_mark_request_attempt,
     seconds_until_next_image_request as quota_seconds_until_next_request,
 )
-from services.launch_state import LaunchStateManager
+from services.golden_three_client import build_keywords_string, fetch_golden_three
+from services.launch_state import WORKFLOW_ASIN_IMPROVEMENT, LaunchStateManager
+from services import sp_api_listings as _sp_api
+from services.asin_snapshot import load_asin_snapshot
 from services.listing_policy import (
     DEFAULT_EU_UK_RESTRICTED_MARKETING_PHRASES,
     DEFAULT_GLOBAL_PROHIBITED_LISTING_TERMS,
@@ -152,7 +155,7 @@ AMAZON_LIMITS = {
     "title": 200,
     "bullet": 500,
     "description": 2000,
-    "backend_keywords": 250,
+    "backend_keywords": 249,
 }
 
 # Load environment variables
@@ -193,6 +196,59 @@ def _open_conn() -> psycopg.Connection:
 
 
 # ---------------------------------------------------------------------------
+# SKU registry helpers (local JSON persistence — no DB write access needed)
+# ---------------------------------------------------------------------------
+_SKU_REGISTRY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), ".streamlit", "sku_registry.json"
+)
+
+
+def _load_sku_registry() -> dict[str, list[str]]:
+    """Load SKU registry from local JSON file.
+
+    Registry format: {"ASIN/MP": ["SKU1", "SKU2", ...], ...}
+    """
+    try:
+        with open(_SKU_REGISTRY_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_sku_registry(registry: dict[str, list[str]]) -> None:
+    """Persist SKU registry to local JSON file."""
+    try:
+        os.makedirs(os.path.dirname(_SKU_REGISTRY_PATH), exist_ok=True)
+        with open(_SKU_REGISTRY_PATH, "w") as f:
+            json.dump(registry, f, indent=2)
+    except Exception as exc:
+        logger.warning("Could not save SKU registry: %s", exc)
+
+
+def _get_skus_for_asin_mp(asin: str, marketplace: str) -> list[str]:
+    """Return sorted list of known SKUs for this ASIN/marketplace pair."""
+    key = f"{asin.upper()}/{marketplace.upper()}"
+    registry = _load_sku_registry()
+    return registry.get(key, [])
+
+
+def _register_sku(asin: str, marketplace: str, sku: str) -> None:
+    """Add a SKU to the registry if it isn't already recorded."""
+    if not sku.strip():
+        return
+    key = f"{asin.upper()}/{marketplace.upper()}"
+    registry = _load_sku_registry()
+    existing = registry.get(key, [])
+    if sku not in existing:
+        existing = [sku] + existing  # most recently used first
+        registry[key] = existing[:20]  # cap at 20 entries per ASIN/MP
+        _save_sku_registry(registry)
+
+
+# ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 def _init_session_state() -> None:
@@ -205,6 +261,7 @@ def _init_session_state() -> None:
         "cs_key_features": "",
         "cs_target_keywords": "",
         "cs_brand_voice": "Professional",
+        "cs_listing_extra_instruction": "",
         "cs_include_aplus": False,
         "cs_aplus_package": None,
         "cs_aplus_asset_cache": {},
@@ -225,9 +282,17 @@ def _init_session_state() -> None:
         "cs_prefill_launch_id": None,
         "cs_key_features_prefill_attempted_launch_id": None,
         "cs_hydrated_launch_id": None,
+        "cs_active_launch_id": None,
         "cs_enforce_listing_policy": True,
         "cs_additional_blocked_terms": "",
         "cs_imagen_strict_spacing": True,
+        # Golden Three keyword data fetched from market_intel (None = not yet fetched)
+        "cs_golden_three": None,
+        "cs_golden_three_launch_id": None,
+        # PPC/JS keyword pool for BST seeding (list of str)
+        "cs_bst_keyword_pool": [],
+        # SP-API push state — marketplace-scoped keys are created dynamically
+        # in _render_push_to_amazon; nothing to pre-init here.
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -449,21 +514,62 @@ def _strip_markdown_fences(raw_text: str) -> str:
     return text.strip()
 
 
+def _sanitise_json_text(text: str) -> str:
+    """Replace unescaped control characters inside JSON string literals.
+
+    Gemini occasionally emits literal newlines / tabs / carriage-returns
+    inside JSON string values, which are invalid per RFC 8259 and cause
+    json.loads to raise "Invalid control character".  We scan the text
+    character-by-character, tracking whether we're inside a string, and
+    replace bare control characters with their safe escape sequences.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    _CTRL_REPLACE = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for ch in text:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch in _CTRL_REPLACE:
+            out.append(_CTRL_REPLACE[ch])
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _parse_json_object_from_text(raw_text: str) -> dict[str, Any]:
     text = _strip_markdown_fences(raw_text)
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
+
+    def _try_parse(s: str) -> dict[str, Any] | None:
+        for attempt in (s, _sanitise_json_text(s)):
+            try:
+                parsed = json.loads(attempt)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return None
+
+    result = _try_parse(text)
+    if result is not None:
+        return result
 
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
-        parsed = json.loads(text[start : end + 1])
-        if isinstance(parsed, dict):
-            return parsed
+        result = _try_parse(text[start : end + 1])
+        if result is not None:
+            return result
 
     raise json.JSONDecodeError("Could not parse JSON object", text, 0)
 
@@ -610,22 +716,27 @@ def _build_opportunity_snapshot(
             risk_rows = list(cur.fetchall())
 
             source_asin = str(launch.get("source_asin") or "").strip().upper()
+            source_marketplace = (
+                str(launch.get("source_marketplace") or "").strip().upper()
+            )
             if source_asin:
                 cur.execute(
                     """
                     SELECT response_data
                     FROM launchpad.jungle_scout_cache
                     WHERE asin = %s
+                      AND (%s = '' OR marketplace = %s)
                       AND endpoint = 'keywords_by_asin'
                     ORDER BY fetched_at DESC
                     LIMIT 8
                     """,
-                    (source_asin,),
+                    (source_asin, source_marketplace, source_marketplace),
                 )
                 js_keyword_payloads = [r.get("response_data") for r in cur.fetchall()]
 
     keywords = [str(row[0]).strip() for row in keyword_rows if row and row[0]]
 
+    # Fallback 2: Jungle Scout cache keywords_by_asin payloads
     if not keywords and js_keyword_payloads:
         extracted: list[str] = []
         seen: set[str] = set()
@@ -642,6 +753,29 @@ def _build_opportunity_snapshot(
                     break
 
         keywords = extracted
+
+    # Fallback 3: market_intel.niche_keyword_bank by source_asin
+    # This is the primary keyword source for improvement-workflow launches that
+    # haven't run a PPC simulation and have no JS cache entries.
+    if not keywords and source_asin:
+        try:
+            with _open_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT keyword
+                        FROM market_intel.niche_keyword_bank
+                        WHERE source_asin = %s
+                          AND keyword IS NOT NULL
+                        ORDER BY monthly_search_volume_exact DESC NULLS LAST
+                        LIMIT 60
+                        """,
+                        (source_asin,),
+                    )
+                    niche_kw_rows = cur.fetchall()
+            keywords = [str(r[0]).strip() for r in niche_kw_rows if r and r[0]]
+        except Exception as exc:
+            logger.debug("niche_keyword_bank fallback failed: %s", exc)
 
     snapshot["ppc_keywords"] = keywords
     snapshot["pricing_summary"] = pricing_rows
@@ -740,16 +874,24 @@ Snapshot:
 
 
 def _prefill_listing_inputs(launch: dict[str, Any]) -> None:
+    is_improvement = launch.get("workflow_type") == WORKFLOW_ASIN_IMPROVEMENT
+
     launch_id = int(launch["launch_id"])
     launch_changed = st.session_state.get("cs_prefill_launch_id") != launch_id
 
-    if launch_changed:
+    if launch_changed and not is_improvement:
         st.session_state["cs_prefill_launch_id"] = launch_id
-        st.session_state["cs_target_keywords"] = ""
         st.session_state["cs_key_features"] = ""
-        st.session_state["cs_target_keywords_input"] = ""
         st.session_state["cs_key_features_input"] = ""
         st.session_state["cs_key_features_prefill_attempted_launch_id"] = None
+
+    # Golden Three is already fetched and cached by _hydrate_saved_creative_state.
+    # Keywords and title are already applied there. This function handles the
+    # remaining gap: key_features (which hydrate does not touch) and falls back
+    # to PPC/JS/niche keywords if golden three was absent.
+    # NOTE: _build_opportunity_snapshot must run for ALL workflow types so that
+    # Fallback 3 (market_intel.niche_keyword_bank) can populate cs_bst_keyword_pool
+    # for improvement-workflow launches that have no PPC simulation or JS cache.
 
     try:
         snapshot, keywords = _build_opportunity_snapshot(launch)
@@ -759,15 +901,25 @@ def _prefill_listing_inputs(launch: dict[str, Any]) -> None:
         )
         return
 
-    keywords_text = ", ".join(keywords) if keywords else ""
-    if not keywords_text:
-        keywords_text = _generate_keywords_from_snapshot(snapshot)
+    # Always store the raw keyword pool for BST seeding regardless of workflow type.
+    if keywords:
+        st.session_state["cs_bst_keyword_pool"] = keywords
 
-    if keywords_text and (
-        launch_changed or not st.session_state.get("cs_target_keywords")
-    ):
-        st.session_state["cs_target_keywords"] = keywords_text
-        st.session_state["cs_target_keywords_input"] = keywords_text
+    # The remaining prefill steps (target_keywords fallback, key_features generation)
+    # are only relevant for new-launch workflow; improvement launches manage their
+    # own inputs via the saved draft / hydration path.
+    if is_improvement:
+        return
+
+    # Fall back to PPC/JS keywords only when neither golden three nor a saved
+    # draft has already populated the field.
+    if not st.session_state.get("cs_target_keywords"):
+        keywords_text = ", ".join(keywords) if keywords else ""
+        if not keywords_text:
+            keywords_text = _generate_keywords_from_snapshot(snapshot)
+        if keywords_text:
+            st.session_state["cs_target_keywords"] = keywords_text
+            st.session_state["cs_target_keywords_input"] = keywords_text
 
     if st.session_state.get("cs_key_features"):
         return
@@ -786,6 +938,87 @@ def _prefill_listing_inputs(launch: dict[str, Any]) -> None:
         st.session_state["cs_key_features_input"] = generated_features
 
 
+def _reset_launch_scoped_state(launch: dict[str, Any]) -> None:
+    """Reset launch-scoped creative state when switching launches."""
+    launch_id = int(launch["launch_id"])
+    previous_launch_id = st.session_state.get("cs_active_launch_id")
+    if previous_launch_id == launch_id:
+        return
+
+    st.session_state["cs_active_launch_id"] = launch_id
+    st.session_state["cs_prefill_launch_id"] = None
+    st.session_state["cs_hydrated_launch_id"] = None
+    st.session_state["cs_key_features_prefill_attempted_launch_id"] = None
+
+    st.session_state["cs_product_name"] = ""
+    st.session_state["cs_key_features"] = ""
+    st.session_state["cs_target_keywords"] = ""
+    st.session_state["cs_generated_listing"] = None
+    st.session_state["cs_edited_listing"] = None
+    st.session_state["cs_include_aplus"] = False
+    st.session_state["cs_aplus_package"] = None
+    st.session_state["cs_aplus_asset_cache"] = {}
+    st.session_state["cs_aplus_last_run_stats"] = None
+    st.session_state["cs_rufus_optimize"] = False
+    st.session_state["cs_active_marketplace"] = "UK"
+    st.session_state["cs_image_gallery"] = {}
+    st.session_state["cs_upload_fingerprints"] = {}
+    st.session_state["cs_golden_three"] = None
+    st.session_state["cs_golden_three_launch_id"] = None
+    st.session_state["cs_bst_keyword_pool"] = []
+    # Clear push state — marketplace-scoped keys are cleared by prefix
+    push_keys = [
+        k for k in st.session_state if k.startswith("cs_push_") or k == "cs_seller_id"
+    ]
+    for k in push_keys:
+        del st.session_state[k]
+
+    for key in (
+        "cs_product_name_input",
+        "cs_key_features_input",
+        "cs_target_keywords_input",
+    ):
+        st.session_state.pop(key, None)
+
+    _reset_listing_editor_state()
+
+
+def _reset_listing_editor_state() -> None:
+    """Clear listing editor widget values to force fresh render."""
+    st.session_state.pop("cs_edit_title", None)
+    st.session_state.pop("cs_edit_description", None)
+    st.session_state.pop("cs_edit_backend_kw", None)
+    for idx in range(5):
+        st.session_state.pop(f"cs_edit_bullet_{idx}", None)
+
+
+def _fetch_and_cache_golden_three(launch: dict[str, Any]) -> dict[str, Any] | None:
+    """Fetch Golden Three result from market_intel and cache in session state.
+
+    Returns the cached row (or None) for the given launch.  Safe to call
+    multiple times — returns the cached value after the first call.
+    """
+    launch_id = int(launch["launch_id"])
+    if st.session_state.get("cs_golden_three_launch_id") == launch_id:
+        return st.session_state.get("cs_golden_three")
+
+    source_asin = str(launch.get("source_asin") or "").strip().upper()
+    target_mps = launch.get("target_marketplaces") or []
+    primary_mp = (
+        str(target_mps[0])
+        if target_mps
+        else str(launch.get("source_marketplace") or "UK")
+    )
+
+    golden_three: dict[str, Any] | None = None
+    if source_asin:
+        golden_three = fetch_golden_three(source_asin, primary_mp)
+
+    st.session_state["cs_golden_three"] = golden_three
+    st.session_state["cs_golden_three_launch_id"] = launch_id
+    return golden_three
+
+
 def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
     launch_id = int(launch["launch_id"])
     if st.session_state.get("cs_hydrated_launch_id") == launch_id:
@@ -795,6 +1028,9 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
 
     target_mps = launch.get("target_marketplaces") or TARGET_MARKETPLACES
     preferred_mp = str(target_mps[0]) if target_mps else "UK"
+
+    # Fetch Golden Three up-front so we can fill any gaps below
+    golden_three = _fetch_and_cache_golden_three(launch)
 
     try:
         with _open_conn() as conn:
@@ -815,8 +1051,77 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
                 row = cur.fetchone()
 
         if not row:
-            st.session_state["cs_generated_listing"] = None
-            st.session_state["cs_edited_listing"] = None
+            # No saved draft.
+            # For improvement-workflow launches, seed from the ASIN snapshot
+            # (current live listing data fetched at import time).
+            _reset_listing_editor_state()
+            snapshot_listing = None
+            if launch.get("workflow_type") == WORKFLOW_ASIN_IMPROVEMENT:
+                try:
+                    with _open_conn() as snap_conn:
+                        snapshot_listing = load_asin_snapshot(
+                            snap_conn, launch_id, preferred_mp
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not load asin_snapshot for launch %s: %s",
+                        launch_id,
+                        exc,
+                    )
+
+            if snapshot_listing:
+                snap_bullets = snapshot_listing.get("bullets") or []
+                if not isinstance(snap_bullets, list):
+                    snap_bullets = []
+                snap_bk = str(snapshot_listing.get("backend_keywords") or "").strip()
+                snap_title = str(snapshot_listing.get("title") or "").strip()
+                restored = {
+                    "title": snap_title,
+                    "bullets": snap_bullets,
+                    "description": str(snapshot_listing.get("description") or ""),
+                    "backend_keywords": snap_bk,
+                    "quality_score": 75,
+                    "quality_notes": ["Loaded from ASIN snapshot"],
+                    "optimization_suggestions": [],
+                }
+                st.session_state["cs_generated_listing"] = restored
+                st.session_state["cs_edited_listing"] = restored
+                # Keywords: Golden Three takes priority; fall back to snapshot BST
+                if golden_three:
+                    kw_text = build_keywords_string(golden_three)
+                else:
+                    kw_text = snap_bk
+                st.session_state["cs_target_keywords"] = kw_text
+                st.session_state["cs_target_keywords_input"] = kw_text
+                st.session_state["cs_product_name"] = snap_title[:200]
+                st.session_state["cs_product_name_input"] = snap_title[:200]
+                if snap_bullets:
+                    bullets_text = "\n".join(
+                        str(b).strip() for b in snap_bullets if str(b).strip()
+                    )
+                    st.session_state["cs_key_features"] = bullets_text
+                    st.session_state["cs_key_features_input"] = bullets_text
+                else:
+                    st.session_state["cs_key_features"] = ""
+                    st.session_state["cs_key_features_input"] = ""
+            else:
+                # No draft and no snapshot — seed from Golden Three if available
+                st.session_state["cs_generated_listing"] = None
+                st.session_state["cs_edited_listing"] = None
+                if golden_three:
+                    kw_text = build_keywords_string(golden_three)
+                    title_draft = str(golden_three.get("title_draft") or "").strip()
+                    st.session_state["cs_target_keywords"] = kw_text
+                    st.session_state["cs_target_keywords_input"] = kw_text
+                    st.session_state["cs_product_name"] = title_draft[:200]
+                    st.session_state["cs_product_name_input"] = title_draft[:200]
+                else:
+                    st.session_state["cs_product_name"] = ""
+                    st.session_state["cs_product_name_input"] = ""
+                    st.session_state["cs_target_keywords"] = ""
+                    st.session_state["cs_target_keywords_input"] = ""
+                st.session_state["cs_key_features"] = ""
+                st.session_state["cs_key_features_input"] = ""
             return
 
         bullets = row.get("bullets", [])
@@ -846,6 +1151,7 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
             "optimization_suggestions": [],
         }
 
+        _reset_listing_editor_state()
         st.session_state["cs_generated_listing"] = restored_listing
         st.session_state["cs_edited_listing"] = restored_listing
         st.session_state["cs_active_marketplace"] = str(
@@ -855,19 +1161,30 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
         st.session_state["cs_include_aplus"] = bool(aplus)
         _hydrate_aplus_package_from_listing_content(launch_id, aplus)
 
-        backend_keywords = str(row.get("backend_keywords") or "")
-        if backend_keywords:
-            st.session_state["cs_target_keywords"] = backend_keywords
-            st.session_state["cs_target_keywords_input"] = backend_keywords
+        # Keywords: prefer Golden Three; fall back to saved backend_keywords
+        if golden_three:
+            kw_text = build_keywords_string(golden_three)
+        else:
+            kw_text = str(row.get("backend_keywords") or "")
+        st.session_state["cs_target_keywords"] = kw_text
+        st.session_state["cs_target_keywords_input"] = kw_text
 
         if bullets:
             bullets_text = "\n".join(str(b).strip() for b in bullets if str(b).strip())
-            if bullets_text:
-                st.session_state["cs_key_features"] = bullets_text
-                st.session_state["cs_key_features_input"] = bullets_text
+            st.session_state["cs_key_features"] = bullets_text
+            st.session_state["cs_key_features_input"] = bullets_text
+        else:
+            st.session_state["cs_key_features"] = ""
+            st.session_state["cs_key_features_input"] = ""
 
-        if not st.session_state.get("cs_product_name"):
-            st.session_state["cs_product_name"] = str(row.get("title") or "")[:100]
+        # Product name: prefer Golden Three title_draft; fall back to saved draft title
+        if golden_three:
+            title_draft = str(golden_three.get("title_draft") or "").strip()
+            product_name = (title_draft or str(row.get("title") or ""))[:200]
+        else:
+            product_name = str(row.get("title") or "")[:100]
+        st.session_state["cs_product_name"] = product_name
+        st.session_state["cs_product_name_input"] = product_name
     except Exception as exc:
         logger.warning(
             "Could not hydrate creative state for launch %s: %s", launch_id, exc
@@ -893,6 +1210,25 @@ def _show_stage_readiness_notice(launch: dict[str, Any]) -> None:
 def _render_listing_inputs(launch: dict[str, Any]) -> None:
     st.subheader("✍️ Listing Generation")
     render_section_save_status(int(launch["launch_id"]), "creative", "listing_draft")
+
+    # Show banner when Golden Three data was auto-loaded from market_intel
+    golden_three: dict[str, Any] | None = st.session_state.get("cs_golden_three")
+    if golden_three:
+        anchor = str(golden_three.get("anchor_keyword") or "").strip()
+        scaler = str(golden_three.get("scaler_keyword") or "").strip()
+        specialist = str(golden_three.get("specialist_keyword") or "").strip()
+        engine = str(golden_three.get("engine_mode") or "").strip()
+        warning = str(golden_three.get("warning") or "").strip()
+        kw_parts = " · ".join(k for k in [anchor, scaler, specialist] if k)
+        banner_lines = [
+            f"**Golden Three keywords loaded** from `market_intel` ({engine} mode): "
+            f"**{kw_parts}**",
+            "Title draft and keywords have been pre-populated below. Edit freely.",
+        ]
+        if warning:
+            banner_lines.append(f"Engine warning: {warning}")
+        st.info("\n\n".join(banner_lines))
+
     launch_description = launch.get("product_description") or ""
 
     if "cs_product_name_input" not in st.session_state:
@@ -906,6 +1242,10 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
     if "cs_target_keywords_input" not in st.session_state:
         st.session_state["cs_target_keywords_input"] = st.session_state.get(
             "cs_target_keywords", ""
+        )
+    if "cs_listing_extra_instruction_input" not in st.session_state:
+        st.session_state["cs_listing_extra_instruction_input"] = st.session_state.get(
+            "cs_listing_extra_instruction", ""
         )
 
     col1, col2 = st.columns(2)
@@ -927,6 +1267,18 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
             help="Bullet points from your product analysis.",
         )
         st.session_state["cs_key_features"] = key_features
+
+        extra_instruction = st.text_area(
+            "Additional Prompt Instruction (optional)",
+            placeholder=(
+                "e.g. Use the phrase 'clinically tested' at least once, "
+                "or maintain a concise technical tone."
+            ),
+            height=90,
+            key="cs_listing_extra_instruction_input",
+            help="Appended to the hidden Gemini prompt for this listing generation run.",
+        )
+        st.session_state["cs_listing_extra_instruction"] = extra_instruction
 
     with col2:
         target_keywords = st.text_area(
@@ -1146,6 +1498,8 @@ def _build_listing_prompt(
     rufus_optimize: bool,
     marketplace: str = "UK",
     blocked_phrases: list[str] | None = None,
+    extra_instruction: str = "",
+    bst_keyword_pool: list[str] | None = None,
 ) -> str:
     voice_desc = {
         "Professional": "authoritative, clear, and business-like",
@@ -1168,6 +1522,19 @@ RUFUS AI OPTIMIZATION:
     if blocked_phrases:
         blocked_lines = "\n".join(f"- {p}" for p in blocked_phrases[:80])
 
+    extra_instruction_block = ""
+    if extra_instruction.strip():
+        extra_instruction_block = (
+            "\nADDITIONAL USER INSTRUCTION (highest priority unless it conflicts with policy/safety rules):\n"
+            f"{extra_instruction.strip()}\n"
+        )
+
+    # BST keyword pool — PPC/JS long-tail keywords available for the BST field
+    bst_pool_block = ""
+    if bst_keyword_pool:
+        pool_str = " ".join(bst_keyword_pool[:60])  # cap to avoid prompt bloat
+        bst_pool_block = f"\nBST KEYWORD POOL (long-tail candidates for backend_keywords):\n{pool_str}\n"
+
     return f"""You are an expert Amazon listing copywriter specializing in {marketplace} marketplace.
 Write a complete, optimized Amazon product listing in a {voice_desc} brand voice.
 
@@ -1177,6 +1544,8 @@ KEY FEATURES:
 
 TARGET KEYWORDS: {target_keywords}
 {rufus_note}
+{bst_pool_block}
+{extra_instruction_block}
 
 OUTPUT FORMAT (respond with valid JSON only, no markdown):
 {{
@@ -1189,7 +1558,7 @@ OUTPUT FORMAT (respond with valid JSON only, no markdown):
     "Bullet 5 (max 500 chars)"
   ],
   "description": "HTML-formatted product description (max 2000 chars, use <b> and <br> tags)",
-  "backend_keywords": "Space-separated backend search terms (max 250 bytes, no repetition of title/bullet keywords)",
+  "backend_keywords": "Space-separated backend search terms — see BST RULES below",
   "quality_score": 85,
   "quality_notes": ["Note 1", "Note 2"],
   "optimization_suggestions": ["Suggestion 1", "Suggestion 2"]
@@ -1199,11 +1568,25 @@ RULES:
 - Title: max 200 characters, primary keyword in first 80 chars
 - Each bullet: max 500 characters, start with capitalized benefit phrase
 - Description: HTML formatted, max 2000 characters
-- Backend keywords: max 250 bytes total, space-separated, no commas
 - quality_score: integer 0-100 based on keyword density, readability, compliance
 - Do NOT include markdown code blocks in response, return raw JSON only
 - Prohibited words/phrases that must NOT appear in title, bullets, description, or backend keywords:
 {blocked_lines}
+
+BST RULES (backend_keywords field — the SEO engine room):
+- Separator: single spaces only. NO commas, semicolons, or quotes. Commas waste byte budget.
+- Hard limit: 249 bytes (UTF-8). Stay at or under 249 bytes total.
+- NEVER repeat any word already in the title or bullet points. Amazon indexes the whole listing as one bag of words — repetition wastes space with zero benefit.
+- NEVER use plurals or word stems separately — Amazon's engine maps "balm" to "balms" automatically. Use the singular root form only.
+- NEVER include brand names (yours or competitors'). Brand name targeting violates Amazon ToS.
+- Fill the BST with content that did NOT make it into the title or bullets:
+  1. High-volume synonyms (e.g. if title says "bucket", BST should contain "pail" "container" "vessel")
+  2. Use cases and personas (e.g. "gym garage beginners rehabilitation physical therapy")
+  3. Common misspellings of high-volume terms (exact-match misspellings still get a relevancy edge)
+  4. Multi-language translations for the top 3-5 concepts (Spanish is high-traffic; German/French for EU)
+  5. Long-tail attributes: materials, sizes, technical specs not in the bullets
+- If a BST KEYWORD POOL was provided above, draw from it — prioritise terms with highest search volume that are absent from the title and bullets.
+- Target as close to 249 bytes as possible without exceeding it. An empty or short BST is a wasted opportunity.
 """
 
 
@@ -1214,6 +1597,8 @@ def _generate_listing(
     brand_voice: str,
     rufus_optimize: bool,
     marketplace: str = "UK",
+    extra_instruction: str = "",
+    bst_keyword_pool: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Generate listing and return (normalized_listing, policy_report)."""
     try:
@@ -1228,6 +1613,8 @@ def _generate_listing(
             rufus_optimize,
             marketplace,
             _effective_blocked_phrases(marketplace),
+            extra_instruction,
+            bst_keyword_pool,
         )
 
         response = model.generate_content(prompt)
@@ -1235,7 +1622,20 @@ def _generate_listing(
         if not isinstance(parsed, dict):
             st.error("❌ AI response did not match expected listing object.")
             return None, None
+        raw_bk = str(parsed.get("backend_keywords") or "").strip()
+        logger.info(
+            "Gemini raw backend_keywords (%d chars): %r",
+            len(raw_bk),
+            raw_bk[:120],
+        )
         normalized, report = _normalize_listing_with_policy(parsed, marketplace)
+        post_bk = str(normalized.get("backend_keywords") or "").strip()
+        logger.info(
+            "Post-normalization backend_keywords (%d chars / %d bytes): %r",
+            len(post_bk),
+            len(post_bk.encode("utf-8")),
+            post_bk[:120],
+        )
         return normalized, report
 
     except json.JSONDecodeError as exc:
@@ -1294,7 +1694,7 @@ def _compute_listing_constraint_score(listing: dict[str, Any]) -> tuple[int, lis
         (
             len(backend_keywords.encode("utf-8")) <= AMAZON_LIMITS["backend_keywords"]
             and bool(backend_keywords.strip()),
-            "Backend keywords within 250 bytes and non-empty",
+            "Backend keywords within 249 bytes and non-empty",
         ),
     ]
 
@@ -1372,7 +1772,7 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
         value=listing.get("backend_keywords", ""),
         height=80,
         key="cs_edit_backend_kw",
-        help="Space-separated, max 250 bytes. No commas, no repetition of title/bullet keywords.",
+        help="Space-separated, max 249 bytes. No commas, no brand names, no repetition of words already in title or bullets.",
     )
     bk_bytes = len((bk_val or "").encode("utf-8"))
     bk_color = "🔴" if bk_bytes > AMAZON_LIMITS["backend_keywords"] else "🟢"
@@ -1788,9 +2188,74 @@ def _slot_has_image(data: dict[str, Any] | None) -> bool:
     return bool(data.get("image_bytes") or data.get("storage_path"))
 
 
+def _render_image_prompt_cards(
+    launch_id: int,
+    product_name: str,
+    product_desc: str,
+) -> None:
+    """Prompt-mode view: display the 7 image prompts as copyable cards."""
+    st.markdown(
+        "Copy each prompt below into **Gemini 3** (or any image generator) "
+        "to produce an Amazon-ready image for that slot."
+    )
+    for slot_num, slot_info in IMAGE_SLOTS.items():
+        prompt_key = f"cs_slot_prompt_{launch_id}_{slot_num}"
+        # Initialise from builder if not yet edited
+        if prompt_key not in st.session_state:
+            st.session_state[prompt_key] = _build_image_prompt(
+                slot_info, product_name, product_desc
+            )
+        with st.container(border=True):
+            hdr_col, icon_col = st.columns([10, 1])
+            with hdr_col:
+                st.markdown(
+                    f"**Slot {slot_num} — {slot_info['icon']} {slot_info['name']}**  \n"
+                    f"<span style='color:grey;font-size:0.85em'>{slot_info['desc']}</span>",
+                    unsafe_allow_html=True,
+                )
+            prompt_text = st.text_area(
+                "Prompt",
+                value=st.session_state[prompt_key],
+                key=f"{prompt_key}_prompt_mode_input",
+                height=110,
+                label_visibility="collapsed",
+                help="Edit then copy into Gemini 3 or another image tool.",
+            )
+            st.session_state[prompt_key] = prompt_text
+            st.caption(
+                f"**Amazon spec:** 2000×2000 px minimum, RGB JPEG, sRGB colour space. "
+                f"Slot 1 (Main Image): pure white background, product fills ≥85% of frame."
+                if slot_num == 1
+                else f"**Amazon spec:** 2000×2000 px minimum, RGB JPEG, sRGB colour space."
+            )
+
+
 def _render_image_gallery(launch: dict[str, Any]) -> None:
     st.subheader("🖼️ Image Gallery (7 Slots)")
     st.caption("Amazon requires 7 images for optimal listing performance.")
+
+    # --- Output mode toggle ---
+    mode_col, spacer = st.columns([2, 5])
+    with mode_col:
+        prompt_mode = st.toggle(
+            "Prompt mode (no image generation)",
+            value=st.session_state.get("cs_gallery_prompt_mode", False),
+            key="cs_gallery_prompt_mode_toggle",
+            help="Switch between generating images via Vertex AI Imagen and outputting "
+            "ready-to-use Gemini 3 prompts for each slot.",
+        )
+    st.session_state["cs_gallery_prompt_mode"] = prompt_mode
+
+    launch_id = launch["launch_id"]
+    launch_description = launch.get("product_description") or ""
+    product_name = (
+        st.session_state.get("cs_product_name") or launch_description or "Product"
+    )
+    product_desc = launch_description
+
+    if prompt_mode:
+        _render_image_prompt_cards(launch_id, product_name, product_desc)
+        return
 
     pacing_col1, pacing_col2 = st.columns([2, 3])
     with pacing_col1:
@@ -1807,13 +2272,6 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
             st.info(f"Next image request available in ~{remaining}s")
         else:
             st.caption("Image generation ready")
-
-    launch_id = launch["launch_id"]
-    launch_description = launch.get("product_description") or ""
-    product_name = (
-        st.session_state.get("cs_product_name") or launch_description or "Product"
-    )
-    product_desc = launch_description
 
     # Load existing gallery from DB
     db_gallery = _load_image_gallery(launch_id)
@@ -2298,6 +2756,119 @@ def _aplus_asset_signature(
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
 
 
+def _render_aplus_prompt_cards(
+    product_name: str,
+    listing: dict[str, Any] | None,
+    brand_voice: str,
+) -> None:
+    """Prompt-mode view: call Gemini for A+ copy+prompts then display as cards."""
+    run_col, _ = st.columns([2, 5])
+    with run_col:
+        generate = st.button(
+            "Generate A+ Prompts",
+            type="primary",
+            use_container_width=True,
+            key="cs_aplus_gen_prompts_btn",
+        )
+
+    if generate:
+        with st.spinner("Generating A+ copy and image prompts via Gemini..."):
+            result = _generate_aplus_copy(product_name, listing, brand_voice)
+        if result:
+            st.session_state["cs_aplus_prompt_mode_copy"] = result
+        else:
+            st.warning("Could not generate A+ prompts. Review the error above.")
+            return
+
+    copy = st.session_state.get("cs_aplus_prompt_mode_copy")
+    if not copy:
+        st.info(
+            "Click **Generate A+ Prompts** to produce image prompts and copy via Gemini."
+        )
+        return
+
+    prompt_map = _build_aplus_image_prompts(copy)
+
+    # A+ copy section
+    with st.expander("📄 A+ Copy (headlines, body text)", expanded=True):
+        hero = copy.get("hero", {})
+        story = copy.get("brand_story", {})
+        tiles = copy.get("feature_tiles", [])
+        comparison = copy.get("comparison", {})
+
+        st.markdown("**Hero Banner**")
+        st.markdown(f"Headline: *{hero.get('headline', '—')}*")
+        st.markdown(f"Body: {hero.get('body', '—')}")
+        st.divider()
+
+        st.markdown("**Brand Story**")
+        st.markdown(f"Headline: *{story.get('headline', '—')}*")
+        st.markdown(f"Body: {story.get('body', '—')}")
+        st.divider()
+
+        for i, tile in enumerate(tiles[:3], 1):
+            st.markdown(f"**Feature Tile {i}**")
+            st.markdown(f"Title: *{tile.get('title', '—')}*")
+            st.markdown(f"Body: {tile.get('body', '—')}")
+        st.divider()
+
+        st.markdown("**Comparison**")
+        st.markdown(f"Title: *{comparison.get('title', '—')}*")
+        st.markdown(f"Body: {comparison.get('body', '—')}")
+
+    # Image prompt cards
+    st.markdown("### Image Prompts")
+    st.markdown(
+        "Copy each prompt into **Gemini 3** (or another image tool), "
+        "then resize to the Amazon A+ module dimensions shown."
+    )
+
+    for asset_key, spec in APLUS_IMAGE_SPECS.items():
+        prompt_text = prompt_map.get(asset_key, "")
+        prompt_ss_key = f"cs_aplus_prompt_{asset_key}"
+        if prompt_ss_key not in st.session_state or generate:
+            st.session_state[prompt_ss_key] = prompt_text
+
+        with st.container(border=True):
+            label = asset_key.replace("_", " ").title()
+            st.markdown(
+                f"**{label}** &nbsp; "
+                f"<span style='color:grey;font-size:0.85em'>"
+                f"{spec['width']}×{spec['height']} px — {spec['desc']}"
+                f"</span>",
+                unsafe_allow_html=True,
+            )
+            edited = st.text_area(
+                "Prompt",
+                value=st.session_state[prompt_ss_key],
+                key=f"{prompt_ss_key}_input",
+                height=100,
+                label_visibility="collapsed",
+                help="Edit then copy into Gemini 3 or another image tool.",
+            )
+            st.session_state[prompt_ss_key] = edited
+            st.caption(
+                f"Amazon A+ spec: exactly {spec['width']}×{spec['height']} px, JPEG."
+            )
+
+    # Copy-all bundle
+    with st.expander("📋 All prompts as plain text (copy-all)", expanded=False):
+        bundle_lines = []
+        for asset_key, spec in APLUS_IMAGE_SPECS.items():
+            label = asset_key.replace("_", " ").title()
+            p = st.session_state.get(f"cs_aplus_prompt_{asset_key}", "")
+            bundle_lines.append(
+                f"--- {label} ({spec['width']}x{spec['height']}px) ---\n{p}\n"
+            )
+        st.text_area(
+            "All prompts",
+            value="\n".join(bundle_lines),
+            height=300,
+            label_visibility="collapsed",
+            key="cs_aplus_prompt_bundle",
+        )
+
+
 def _render_aplus_engine(
     launch: dict[str, Any], listing: dict[str, Any] | None
 ) -> None:
@@ -2306,6 +2877,18 @@ def _render_aplus_engine(
         "Generates Amazon-ready A+ copy + images using your listing and gallery images. "
         "Assets are resized to Amazon module dimensions."
     )
+
+    # --- Output mode toggle ---
+    mode_col, spacer = st.columns([2, 5])
+    with mode_col:
+        prompt_mode = st.toggle(
+            "Prompt mode (no image generation)",
+            value=st.session_state.get("cs_aplus_prompt_mode", False),
+            key="cs_aplus_prompt_mode_toggle",
+            help="Switch between generating images via Vertex AI Imagen and outputting "
+            "ready-to-use Gemini 3 prompts for each A+ module.",
+        )
+    st.session_state["cs_aplus_prompt_mode"] = prompt_mode
 
     launch_id = int(launch["launch_id"])
     if not st.session_state.get("cs_aplus_package") and listing is not None:
@@ -2318,6 +2901,14 @@ def _render_aplus_engine(
         or launch.get("product_description")
         or "Product"
     )
+
+    if prompt_mode:
+        _render_aplus_prompt_cards(
+            product_name=product_name,
+            listing=listing,
+            brand_voice=st.session_state.get("cs_brand_voice", "Professional"),
+        )
+        return
 
     last_stats = st.session_state.get("cs_aplus_last_run_stats") or {}
     if int(last_stats.get("launch_id") or -1) == launch_id:
@@ -2639,6 +3230,7 @@ def _render_version_management(launch_id: int, marketplace: str) -> None:
                         "quality_notes": ["Restored from version history"],
                         "optimization_suggestions": [],
                     }
+                    _reset_listing_editor_state()
                     st.session_state["cs_generated_listing"] = restored
                     st.session_state["cs_edited_listing"] = restored
                     _hydrate_aplus_package_from_listing_content(launch_id, aplus)
@@ -2707,6 +3299,341 @@ def _render_marketplace_tabs(launch: dict[str, Any]) -> str:
                 st.caption(f"Active marketplace: **{mp}**")
 
     return selected_mp
+
+
+# ---------------------------------------------------------------------------
+# Push to Amazon (SP-API Listings Items)
+# ---------------------------------------------------------------------------
+
+
+def _get_launchpad_dsn() -> str:
+    """Return LAUNCHPAD_DB_DSN from the environment."""
+    return resolve_dsn("LAUNCHPAD_DB_DSN", "MARKET_INTEL_DSN", "PG_DSN")
+
+
+def _resolve_seller_id_cached() -> str | None:
+    """Return cached seller_id from session state, reading AMAZON_SELLER_ID env var."""
+    if st.session_state.get("cs_seller_id"):
+        return st.session_state["cs_seller_id"]
+    try:
+        seller_id = _sp_api.get_seller_id()
+        st.session_state["cs_seller_id"] = seller_id
+        return seller_id
+    except Exception as exc:
+        logger.warning("Could not resolve seller_id: %s", exc)
+        return None
+
+
+def _render_push_to_amazon(
+    launch: dict[str, Any],
+    marketplace: str,
+    listing: dict[str, Any] | None,
+) -> None:
+    """Render the Push to Amazon panel below the Save Draft section."""
+
+    st.subheader("🚀 Push to Amazon")
+
+    # Marketplace-scoped session state keys — prevents a cached SKU/validation
+    # from one marketplace bleeding into another marketplace's push panel.
+    mp_key = marketplace.upper()
+    _sku_key = f"cs_push_sku_{mp_key}"
+    _pt_key = f"cs_push_product_type_{mp_key}"
+    _val_key = f"cs_push_validation_result_{mp_key}"
+
+    if not listing:
+        st.info("Generate and save a listing draft before pushing to Amazon.")
+        return
+
+    asin = str(launch.get("source_asin") or "").strip().upper()
+    if not asin:
+        st.warning("No ASIN associated with this launch — cannot push.")
+        return
+
+    # ----------------------------------------------------------------
+    # Resolve seller ID (env var AMAZON_SELLER_ID)
+    # ----------------------------------------------------------------
+    seller_id = _resolve_seller_id_cached()
+    if not seller_id:
+        st.error(
+            "**AMAZON_SELLER_ID** is not set. "
+            "Add it to your `.env` file: `AMAZON_SELLER_ID=<your seller ID>`"
+        )
+        return
+
+    # ----------------------------------------------------------------
+    # product_type from asin_snapshots; SKU from registry or entered manually
+    # ----------------------------------------------------------------
+    auto_meta = None
+    try:
+        auto_meta = _sp_api.lookup_product_type(_get_launchpad_dsn(), asin, marketplace)
+    except Exception as exc:
+        logger.warning("product_type lookup failed: %s", exc)
+
+    if auto_meta and not st.session_state.get(_pt_key):
+        st.session_state[_pt_key] = auto_meta.product_type
+
+    if auto_meta:
+        st.caption(f"Product type from snapshot: **{auto_meta.product_type}**")
+    else:
+        st.info(
+            f"No snapshot found for **{asin}** / **{marketplace}**. "
+            "Enter the product type manually."
+        )
+
+    with st.expander("SKU & Product Type", expanded=True):
+        sku_col, pt_col = st.columns(2)
+        with sku_col:
+            known_skus = _get_skus_for_asin_mp(asin, marketplace)
+            _new_sku_sentinel = "— Enter new SKU —"
+            sku_options = known_skus + [_new_sku_sentinel]
+
+            # If there are no known SKUs, skip the selectbox and go straight to text_input
+            if known_skus:
+                # Default selection: prefer previously used session value, else first known
+                current_sku_val = st.session_state.get(_sku_key, "")
+                if current_sku_val and current_sku_val in known_skus:
+                    default_idx = sku_options.index(current_sku_val)
+                else:
+                    default_idx = 0
+
+                selected_option = st.selectbox(
+                    "SKU",
+                    options=sku_options,
+                    index=default_idx,
+                    key=f"cs_push_sku_select_{mp_key}",
+                    help="Select a previously used SKU or choose '— Enter new SKU —' to add one.",
+                )
+                if selected_option == _new_sku_sentinel:
+                    new_sku = st.text_input(
+                        "New SKU",
+                        value="",
+                        key=f"cs_push_sku_new_{mp_key}",
+                        placeholder="e.g. MYPRODUCT-DE-001",
+                        help="Enter the exact Amazon seller SKU for this ASIN.",
+                    ).strip()
+                    st.session_state[_sku_key] = new_sku
+                else:
+                    st.session_state[_sku_key] = selected_option
+            else:
+                st.session_state[_sku_key] = (
+                    st.text_input(
+                        "SKU",
+                        value=st.session_state.get(_sku_key, ""),
+                        key=f"cs_push_sku_input_{mp_key}",
+                        placeholder="e.g. MYPRODUCT-DE-001",
+                        help="Your Amazon seller SKU for this ASIN. Saved for future use.",
+                    )
+                    or ""
+                ).strip()
+
+        with pt_col:
+            st.session_state[_pt_key] = st.text_input(
+                "Product Type",
+                value=st.session_state.get(_pt_key, ""),
+                key=f"cs_push_product_type_input_{mp_key}",
+                placeholder="e.g. PET_FOOD",
+                help="Amazon product type. Auto-filled from snapshot if available.",
+            )
+
+    sku = st.session_state.get(_sku_key, "").strip()
+    product_type = st.session_state.get(_pt_key, "").strip()
+
+    if not sku or not product_type:
+        st.warning("Enter a valid SKU and product type to enable push.")
+        return
+
+    # ----------------------------------------------------------------
+    # Content summary
+    # ----------------------------------------------------------------
+    title = listing.get("title", "")
+    bullets = listing.get("bullets") or []
+    description = listing.get("description", "")
+    keywords = listing.get("backend_keywords", "")
+
+    with st.expander("Content to push", expanded=False):
+        st.markdown(f"**Title** ({len(title)} chars): {title}")
+        st.markdown(
+            f"**Bullets**: {len([b for b in bullets if str(b).strip()])} bullet(s)"
+        )
+        for i, b in enumerate(bullets, 1):
+            if str(b).strip():
+                st.markdown(f"  {i}. {b}")
+        st.markdown(f"**Description** ({len(description)} chars)")
+        kw_space = " ".join(keywords.replace(",", " ").split())
+        st.markdown(f"**Backend keywords** ({len(kw_space.encode())} bytes)")
+
+    # ----------------------------------------------------------------
+    # Client-side validation
+    # ----------------------------------------------------------------
+    client_check = _sp_api.validate_content(
+        title, bullets or None, description or None, keywords or None
+    )
+    if not client_check.ok:
+        st.error("Fix these issues before pushing:")
+        for err in client_check.errors:
+            st.markdown(f"- {err}")
+        return
+
+    # ----------------------------------------------------------------
+    # Validate Only (dry run)
+    # ----------------------------------------------------------------
+    val_col, push_col = st.columns(2)
+
+    last_validation: _sp_api.PushResult | None = st.session_state.get(_val_key)
+
+    with val_col:
+        if st.button(
+            "🔍 Validate with Amazon",
+            use_container_width=True,
+            key=f"cs_btn_validate_{mp_key}",
+        ):
+            with st.spinner("Running validation preview..."):
+                result = _sp_api.push_listing_content(
+                    seller_id=seller_id,
+                    sku=sku,
+                    marketplace=marketplace,
+                    product_type=product_type,
+                    title=title or None,
+                    bullets=bullets or None,
+                    description=description or None,
+                    keywords=keywords or None,
+                    preview=True,
+                )
+            st.session_state[_val_key] = result
+            last_validation = result
+            # Save this SKU for future use as soon as the user runs a validation
+            if sku:
+                _register_sku(asin, marketplace, sku)
+            st.rerun()
+
+    # ----------------------------------------------------------------
+    # Display last validation result
+    # ----------------------------------------------------------------
+    if last_validation is not None:
+        if last_validation.status in ("VALID", "ACCEPTED"):
+            st.success("Validation passed — Amazon accepted the content (dry run).")
+        elif last_validation.status == "INVALID":
+            st.error("Validation failed — Amazon rejected the content.")
+        elif last_validation.status == "ERROR":
+            st.error(f"Validation error: {last_validation.error_message}")
+        else:
+            st.warning(f"Unexpected validation status: {last_validation.status}")
+
+        if last_validation.errors:
+            with st.expander(
+                f"{len(last_validation.errors)} error(s) from Amazon", expanded=True
+            ):
+                for issue in last_validation.errors:
+                    st.markdown(
+                        f"- **[{issue.get('severity', '?')}]** "
+                        f"`{issue.get('attributeName', '?')}`: {issue.get('message', '')}"
+                    )
+        if last_validation.warnings:
+            with st.expander(
+                f"{len(last_validation.warnings)} warning(s) from Amazon",
+                expanded=False,
+            ):
+                for issue in last_validation.warnings:
+                    st.markdown(
+                        f"- **[{issue.get('severity', '?')}]** "
+                        f"`{issue.get('attributeName', '?')}`: {issue.get('message', '')}"
+                    )
+
+    # ----------------------------------------------------------------
+    # Live push — only offered after a successful validation
+    # ----------------------------------------------------------------
+    validation_ok = (
+        last_validation is not None
+        and last_validation.status in ("VALID", "ACCEPTED")
+        and not last_validation.errors
+    )
+
+    with push_col:
+        push_disabled = not validation_ok
+        push_btn = st.button(
+            "📤 Push Live to Amazon",
+            use_container_width=True,
+            key=f"cs_btn_push_live_{mp_key}",
+            disabled=push_disabled,
+            type="primary",
+        )
+
+    if (
+        push_disabled
+        and last_validation is not None
+        and last_validation.status not in ("VALID", "ACCEPTED")
+    ):
+        st.caption("Run a successful validation before pushing live.")
+
+    if push_btn and validation_ok:
+        st.session_state[f"cs_push_confirm_pending_{mp_key}"] = True
+
+    if st.session_state.get(f"cs_push_confirm_pending_{mp_key}"):
+        with st.expander("⚠️ Confirm Live Push", expanded=True):
+            st.warning(
+                f"You are about to **push changes live to Amazon** for "
+                f"ASIN **{asin}** / SKU **{sku}** on **{marketplace}**. "
+                "This will update the live listing immediately."
+            )
+            confirm = st.checkbox(
+                "I understand this will update the live Amazon listing.",
+                key=f"cs_push_confirm_checkbox_{mp_key}",
+            )
+            col_confirm, col_cancel = st.columns([1, 1])
+            with col_cancel:
+                if st.button(
+                    "Cancel",
+                    key=f"cs_btn_push_cancel_{mp_key}",
+                    use_container_width=True,
+                ):
+                    st.session_state[f"cs_push_confirm_pending_{mp_key}"] = False
+                    st.rerun()
+            with col_confirm:
+                if st.button(
+                    "✅ Confirm Push",
+                    key=f"cs_btn_push_confirm_{mp_key}",
+                    type="primary",
+                    disabled=not confirm,
+                    use_container_width=True,
+                ):
+                    st.session_state[f"cs_push_confirm_pending_{mp_key}"] = False
+                    with st.spinner("Pushing to Amazon..."):
+                        live_result = _sp_api.push_listing_content(
+                            seller_id=seller_id,
+                            sku=sku,
+                            marketplace=marketplace,
+                            product_type=product_type,
+                            title=title or None,
+                            bullets=bullets or None,
+                            description=description or None,
+                            keywords=keywords or None,
+                            preview=False,
+                        )
+                    if live_result.status in ("VALID", "ACCEPTED"):
+                        st.success(
+                            f"Listing pushed successfully! "
+                            f"Submission ID: `{live_result.submission_id}`"
+                        )
+                        _register_sku(asin, marketplace, sku)
+                        st.session_state[_val_key] = None
+                    elif (
+                        live_result.status == "ERROR"
+                        and "429" in live_result.error_message
+                    ):
+                        st.error(live_result.error_message)
+                        st.info(
+                            "Amazon has rate-limited this request. Wait and try again."
+                        )
+                    else:
+                        st.error(
+                            f"Push failed (status={live_result.status}): "
+                            f"{live_result.error_message or 'See issues below.'}"
+                        )
+                        if live_result.errors:
+                            for issue in live_result.errors:
+                                st.markdown(
+                                    f"- **{issue.get('attributeName', '?')}**: {issue.get('message', '')}"
+                                )
 
 
 # ---------------------------------------------------------------------------
@@ -2910,6 +3837,7 @@ def main() -> None:
     # --- Non-blocking stage readiness notice ---
     _show_stage_readiness_notice(selected_launch)
 
+    _reset_launch_scoped_state(selected_launch)
     _render_launch_info(selected_launch)
     _hydrate_saved_creative_state(selected_launch)
     _prefill_listing_inputs(selected_launch)
@@ -2943,6 +3871,17 @@ def main() -> None:
                     st.error("❌ Please enter a Product Name.")
                 else:
                     with st.spinner("🤖 Generating optimized listing with Gemini..."):
+                        # Build BST pool: golden three words + PPC/JS long-tail
+                        _gt = st.session_state.get("cs_golden_three") or {}
+                        _bst_pool = [
+                            w
+                            for w in [
+                                str(_gt.get("anchor_keyword") or "").strip(),
+                                str(_gt.get("scaler_keyword") or "").strip(),
+                                str(_gt.get("specialist_keyword") or "").strip(),
+                            ]
+                            if w
+                        ] + list(st.session_state.get("cs_bst_keyword_pool") or [])
                         listing, policy_report = _generate_listing(
                             product_name=product_name,
                             key_features=st.session_state.get("cs_key_features", ""),
@@ -2956,13 +3895,31 @@ def main() -> None:
                                 "cs_rufus_optimize", False
                             ),
                             marketplace=active_marketplace,
+                            extra_instruction=st.session_state.get(
+                                "cs_listing_extra_instruction", ""
+                            ),
+                            bst_keyword_pool=_bst_pool or None,
                         )
                     if listing:
+                        _reset_listing_editor_state()
                         st.session_state["cs_generated_listing"] = listing
                         st.session_state["cs_edited_listing"] = listing
                         st.session_state["cs_listing_policy_report"] = (
                             policy_report or {}
                         )
+                        # Surface BST diagnostic info so empty-field issues are visible
+                        bk_val = str(listing.get("backend_keywords") or "").strip()
+                        bst_pool_used = _bst_pool or []
+                        with st.expander("🔍 BST diagnostic", expanded=not bk_val):
+                            st.write(
+                                f"**BST pool fed to Gemini** ({len(bst_pool_used)} terms):",
+                                bst_pool_used[:20],
+                            )
+                            st.write(
+                                f"**backend_keywords after normalization** "
+                                f"({len(bk_val.encode('utf-8'))} / 249 bytes):"
+                            )
+                            st.code(bk_val or "(empty)", language=None)
                         st.success("✅ Listing generated!")
                         st.rerun()
 
@@ -3000,6 +3957,13 @@ def main() -> None:
                         st.success("✅ Draft saved!")
                         st.rerun()
 
+            st.divider()
+            _render_push_to_amazon(
+                launch=selected_launch,
+                marketplace=active_marketplace,
+                listing=st.session_state.get("cs_edited_listing") or generated,
+            )
+
     # Localized listings for other marketplaces
     for i, (tab, mp) in enumerate(zip(mp_tabs[1:], target_mps[1:]), 1):
         with tab:
@@ -3021,6 +3985,16 @@ def main() -> None:
                         st.error("❌ Set Product Name in the UK tab first.")
                     else:
                         with st.spinner(f"🤖 Generating {mp} listing..."):
+                            _gt = st.session_state.get("cs_golden_three") or {}
+                            _bst_pool = [
+                                w
+                                for w in [
+                                    str(_gt.get("anchor_keyword") or "").strip(),
+                                    str(_gt.get("scaler_keyword") or "").strip(),
+                                    str(_gt.get("specialist_keyword") or "").strip(),
+                                ]
+                                if w
+                            ] + list(st.session_state.get("cs_bst_keyword_pool") or [])
                             mp_listing, policy_report = _generate_listing(
                                 product_name=product_name,
                                 key_features=st.session_state.get(
@@ -3036,6 +4010,10 @@ def main() -> None:
                                     "cs_rufus_optimize", False
                                 ),
                                 marketplace=mp,
+                                extra_instruction=st.session_state.get(
+                                    "cs_listing_extra_instruction", ""
+                                ),
+                                bst_keyword_pool=_bst_pool or None,
                             )
                         if mp_listing:
                             st.session_state[f"cs_listing_{mp}"] = mp_listing
