@@ -37,6 +37,12 @@ PURSUIT_PROVEN: str = "Proven"
 PURSUIT_GOLDMINE: str = "Goldmine"
 
 # ---------------------------------------------------------------------------
+# Workflow type constants
+# ---------------------------------------------------------------------------
+WORKFLOW_NEW_LAUNCH: str = "new_launch"
+WORKFLOW_ASIN_IMPROVEMENT: str = "asin_improvement"
+
+# ---------------------------------------------------------------------------
 # Stage names (for display / summary)
 # ---------------------------------------------------------------------------
 _STAGE_NAMES: dict[int, str] = {
@@ -69,6 +75,9 @@ class LaunchStateManager:
     PURSUIT_SATURATED = PURSUIT_SATURATED
     PURSUIT_PROVEN = PURSUIT_PROVEN
     PURSUIT_GOLDMINE = PURSUIT_GOLDMINE
+
+    WORKFLOW_NEW_LAUNCH = WORKFLOW_NEW_LAUNCH
+    WORKFLOW_ASIN_IMPROVEMENT = WORKFLOW_ASIN_IMPROVEMENT
 
     # ------------------------------------------------------------------
     # Create
@@ -135,6 +144,70 @@ class LaunchStateManager:
                 raise RuntimeError("Failed to create launch; no launch_id returned.")
             return int(row[0])
 
+    def create_improvement_launch(
+        self,
+        conn: psycopg.Connection,
+        asin: str,
+        marketplace: str,
+        launch_name: str | None = None,
+        product_description: str | None = None,
+        product_category: str | None = None,
+    ) -> int:
+        """
+        Create an ASIN improvement launch and return the launch_id.
+
+        Improvement workflows start directly at creative work (stage 4),
+        and set workflow_type to 'asin_improvement' when the column exists.
+        """
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO launchpad.product_launches
+                        (source_asin, source_marketplace, target_marketplaces, launch_name,
+                         product_description, product_category, current_stage, workflow_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING launch_id
+                    """,
+                    (
+                        asin,
+                        marketplace,
+                        [marketplace],
+                        launch_name,
+                        product_description,
+                        product_category,
+                        STAGE_CREATIVE,
+                        WORKFLOW_ASIN_IMPROVEMENT,
+                    ),
+                )
+            except errors.UndefinedColumn:
+                conn.rollback()
+                cur.execute(
+                    """
+                    INSERT INTO launchpad.product_launches
+                        (source_asin, source_marketplace, target_marketplaces, launch_name,
+                         product_description, product_category, current_stage)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING launch_id
+                    """,
+                    (
+                        asin,
+                        marketplace,
+                        [marketplace],
+                        launch_name,
+                        product_description,
+                        product_category,
+                        STAGE_CREATIVE,
+                    ),
+                )
+
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Failed to create improvement launch; no launch_id returned."
+                )
+            return int(row[0])
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
@@ -165,6 +238,7 @@ class LaunchStateManager:
                     """
                     SELECT launch_id, source_asin, source_marketplace,
                            target_marketplaces, launch_name, is_archived, archived_at,
+                           workflow_type,
                            product_description, product_category,
                            pursuit_score, pursuit_category, current_stage,
                            created_at, updated_at
@@ -193,6 +267,7 @@ class LaunchStateManager:
                     row["launch_name"] = None
                     row["is_archived"] = False
                     row["archived_at"] = None
+                    row["workflow_type"] = WORKFLOW_NEW_LAUNCH
                 return row
 
     # ------------------------------------------------------------------
@@ -613,6 +688,7 @@ class LaunchStateManager:
                         """
                         SELECT launch_id, source_asin, source_marketplace, launch_name,
                                is_archived, archived_at,
+                               workflow_type,
                                target_marketplaces, product_description, product_category,
                                pursuit_score, pursuit_category, current_stage,
                                created_at, updated_at
@@ -629,6 +705,7 @@ class LaunchStateManager:
                         """
                         SELECT launch_id, source_asin, source_marketplace, launch_name,
                                is_archived, archived_at,
+                               workflow_type,
                                target_marketplaces, product_description, product_category,
                                pursuit_score, pursuit_category, current_stage,
                                created_at, updated_at
@@ -678,4 +755,5 @@ class LaunchStateManager:
                     row["launch_name"] = None
                     row["is_archived"] = False
                     row["archived_at"] = None
+                    row["workflow_type"] = WORKFLOW_NEW_LAUNCH
                 return rows

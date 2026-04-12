@@ -235,6 +235,14 @@ def normalize_listing_with_policy(
         seen_tokens.add(key)
         backend_tokens.append(token)
     backend = " ".join(backend_tokens)
+
+    # Fallback: if deduplication removed everything, keep original keywords
+    # rather than leaving backend_keywords empty (wasted SEO opportunity)
+    if not backend:
+        original_backend = str(normalized.get("backend_keywords") or "").strip()
+        if original_backend:
+            backend = original_backend
+
     backend, backend_trimmed = truncate_to_utf8_bytes(
         backend, amazon_limits["backend_keywords"]
     )

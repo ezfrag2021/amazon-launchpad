@@ -67,49 +67,123 @@ TARGET_MARKETPLACES = ["UK", "DE", "FR", "IT", "ES"]
 
 BRAND_VOICES = ["Professional", "Friendly", "Technical", "Luxury"]
 
-IMAGE_SLOTS: dict[int, dict[str, str]] = {
-    1: {
+# Full catalogue of available image slot types.
+# Slot 1 is always 'main_white_bg' (Amazon requirement). Slots 2-7 are user-configurable.
+IMAGE_TYPE_CATALOGUE: dict[str, dict[str, str]] = {
+    "main_white_bg": {
         "name": "Main Image",
-        "type": "main_white_bg",
         "desc": "White background, product only",
         "icon": "🖼️",
     },
-    2: {
+    "lifestyle": {
         "name": "Lifestyle",
-        "type": "lifestyle",
         "desc": "Product in use / lifestyle context",
         "icon": "🌟",
     },
-    3: {
+    "infographic": {
         "name": "Infographic",
-        "type": "infographic",
         "desc": "Features & benefits callouts",
         "icon": "📊",
     },
-    4: {
+    "comparison": {
         "name": "Comparison",
-        "type": "comparison",
         "desc": "vs. competitors / before-after",
         "icon": "⚖️",
     },
-    5: {
+    "dimensions": {
         "name": "Dimensions",
-        "type": "dimensions",
         "desc": "Size reference / measurements",
         "icon": "📐",
     },
-    6: {
+    "packaging": {
         "name": "Packaging",
-        "type": "packaging",
         "desc": "What's in the box",
         "icon": "📦",
     },
-    7: {
+    "in_use": {
         "name": "In-Use",
-        "type": "in_use",
         "desc": "Hands using the product",
         "icon": "🤲",
     },
+    "before_after": {
+        "name": "Before & After",
+        "desc": "Results transformation",
+        "icon": "✨",
+    },
+    "ingredients": {
+        "name": "Key Ingredients",
+        "desc": "Active ingredients / key actives callout",
+        "icon": "🧪",
+    },
+    "how_to_use": {
+        "name": "How to Use",
+        "desc": "Step-by-step usage guide",
+        "icon": "📋",
+    },
+    "sensory": {
+        "name": "Texture & Sensory",
+        "desc": "Close-up texture / sensory detail",
+        "icon": "💧",
+    },
+    "certifications": {
+        "name": "Claims & Certifications",
+        "desc": "Vegan, organic, dermatologist-tested, etc.",
+        "icon": "🏅",
+    },
+    "social_proof": {
+        "name": "Social Proof",
+        "desc": "Review quotes / customer results",
+        "icon": "⭐",
+    },
+    "variant_range": {
+        "name": "Variant Range",
+        "desc": "Colour / scent / size range shot",
+        "icon": "🎨",
+    },
+}
+
+# Default slot-type assignments (used when no per-launch config exists).
+# Slot 1 is locked to main_white_bg.
+DEFAULT_SLOT_TYPES: dict[int, str] = {
+    1: "main_white_bg",
+    2: "lifestyle",
+    3: "infographic",
+    4: "comparison",
+    5: "dimensions",
+    6: "packaging",
+    7: "in_use",
+}
+
+# Category-aware default overrides: map product category keywords to slot-type suggestions.
+# Keys are lowercase substrings matched against the product category/description.
+CATEGORY_SLOT_OVERRIDES: dict[str, dict[int, str]] = {
+    # Beauty / personal care consumables — drop dimensions & packaging
+    "shampoo": {5: "before_after", 6: "ingredients"},
+    "conditioner": {5: "before_after", 6: "ingredients"},
+    "serum": {5: "before_after", 6: "ingredients"},
+    "moisturiser": {5: "sensory", 6: "ingredients"},
+    "moisturizer": {5: "sensory", 6: "ingredients"},
+    "cleanser": {5: "before_after", 6: "how_to_use"},
+    "skincare": {5: "before_after", 6: "ingredients"},
+    "haircare": {5: "before_after", 6: "ingredients"},
+    "hair care": {5: "before_after", 6: "ingredients"},
+    "supplement": {5: "certifications", 6: "ingredients"},
+    "vitamin": {5: "certifications", 6: "ingredients"},
+    "protein": {5: "certifications", 6: "ingredients"},
+    "food": {5: "sensory", 6: "certifications"},
+    "snack": {5: "sensory", 6: "certifications"},
+    "coffee": {5: "sensory", 6: "how_to_use"},
+    "tea": {5: "sensory", 6: "how_to_use"},
+    "perfume": {5: "sensory", 6: "variant_range"},
+    "fragrance": {5: "sensory", 6: "variant_range"},
+    "candle": {5: "sensory", 6: "variant_range"},
+}
+
+# Build the legacy IMAGE_SLOTS dict dynamically from DEFAULT_SLOT_TYPES so that
+# any code that still references IMAGE_SLOTS continues to work unchanged.
+IMAGE_SLOTS: dict[int, dict[str, str]] = {
+    slot_num: {"type": type_key, **IMAGE_TYPE_CATALOGUE[type_key]}
+    for slot_num, type_key in DEFAULT_SLOT_TYPES.items()
 }
 
 APLUS_IMAGE_SPECS: dict[str, dict[str, Any]] = {
@@ -601,6 +675,27 @@ def _normalize_keyword_candidate(value: str) -> str:
     return text
 
 
+def _normalize_backend_keywords_to_csv(raw: str) -> str:
+    """Convert a backend_keywords string to comma-separated format.
+
+    Amazon backend_keywords are stored as a space-separated string
+    (e.g. "insulated bottle stainless steel water bottle").  The Target
+    Keywords field is labelled "comma-separated", so we split on existing
+    commas first, then fall back to splitting on whitespace, and rejoin
+    with ", ".
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    # If commas are already present, normalise spacing around them and return.
+    if "," in text:
+        parts = [p.strip() for p in text.split(",")]
+        return ", ".join(p for p in parts if p)
+    # Otherwise treat each whitespace-delimited token as a separate keyword.
+    tokens = text.split()
+    return ", ".join(tokens)
+
+
 def _extract_keywords_from_js_payload(payload: Any, limit: int = 20) -> list[str]:
     extracted: list[str] = []
     seen: set[str] = set()
@@ -734,30 +829,37 @@ def _build_opportunity_snapshot(
                 )
                 js_keyword_payloads = [r.get("response_data") for r in cur.fetchall()]
 
-    keywords = [str(row[0]).strip() for row in keyword_rows if row and row[0]]
+    # Collect keywords from ALL available sources and merge them.
+    # Priority order: PPC simulation > Jungle Scout cache > niche_keyword_bank
+    all_keywords: list[str] = []
+    seen_keywords: set[str] = set()
 
-    # Fallback 2: Jungle Scout cache keywords_by_asin payloads
-    if not keywords and js_keyword_payloads:
-        extracted: list[str] = []
-        seen: set[str] = set()
+    # Source 1: PPC simulation keywords
+    for row in keyword_rows:
+        if row and row[0]:
+            kw = str(row[0]).strip()
+            key_l = kw.lower()
+            if key_l and key_l not in seen_keywords:
+                seen_keywords.add(key_l)
+                all_keywords.append(kw)
+
+    # Source 2: Jungle Scout cache keywords_by_asin payloads
+    if js_keyword_payloads:
         for payload in js_keyword_payloads:
-            if len(extracted) >= 20:
+            if len(all_keywords) >= 60:
                 break
-            for kw in _extract_keywords_from_js_payload(payload, limit=20):
+            for kw in _extract_keywords_from_js_payload(payload, limit=60):
                 key_l = kw.lower()
-                if key_l in seen:
+                if key_l in seen_keywords:
                     continue
-                seen.add(key_l)
-                extracted.append(kw)
-                if len(extracted) >= 20:
+                seen_keywords.add(key_l)
+                all_keywords.append(kw)
+                if len(all_keywords) >= 60:
                     break
 
-        keywords = extracted
-
-    # Fallback 3: market_intel.niche_keyword_bank by source_asin
-    # This is the primary keyword source for improvement-workflow launches that
-    # haven't run a PPC simulation and have no JS cache entries.
-    if not keywords and source_asin:
+    # Source 3: market_intel.niche_keyword_bank by source_asin
+    # Critical for improvement-workflow launches and for enriching BST pool
+    if source_asin:
         try:
             with _open_conn() as conn:
                 with conn.cursor() as cur:
@@ -773,9 +875,19 @@ def _build_opportunity_snapshot(
                         (source_asin,),
                     )
                     niche_kw_rows = cur.fetchall()
-            keywords = [str(r[0]).strip() for r in niche_kw_rows if r and r[0]]
+            for r in niche_kw_rows:
+                if r and r[0]:
+                    kw = str(r[0]).strip()
+                    key_l = kw.lower()
+                    if key_l and key_l not in seen_keywords:
+                        seen_keywords.add(key_l)
+                        all_keywords.append(kw)
+                        if len(all_keywords) >= 60:
+                            break
         except Exception as exc:
-            logger.debug("niche_keyword_bank fallback failed: %s", exc)
+            logger.debug("niche_keyword_bank fetch failed: %s", exc)
+
+    keywords = all_keywords
 
     snapshot["ppc_keywords"] = keywords
     snapshot["pricing_summary"] = pricing_rows
@@ -1090,7 +1202,7 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
                 if golden_three:
                     kw_text = build_keywords_string(golden_three)
                 else:
-                    kw_text = snap_bk
+                    kw_text = _normalize_backend_keywords_to_csv(snap_bk)
                 st.session_state["cs_target_keywords"] = kw_text
                 st.session_state["cs_target_keywords_input"] = kw_text
                 st.session_state["cs_product_name"] = snap_title[:200]
@@ -1165,7 +1277,9 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
         if golden_three:
             kw_text = build_keywords_string(golden_three)
         else:
-            kw_text = str(row.get("backend_keywords") or "")
+            kw_text = _normalize_backend_keywords_to_csv(
+                str(row.get("backend_keywords") or "")
+            )
         st.session_state["cs_target_keywords"] = kw_text
         st.session_state["cs_target_keywords_input"] = kw_text
 
@@ -1767,9 +1881,14 @@ def _render_listing_display(listing: dict[str, Any]) -> dict[str, Any]:
     edited["description"] = desc_val
 
     # Backend keywords
+    # Debug: Show what value is being passed to the text area
+    bk_from_listing = listing.get("backend_keywords", "")
+    st.caption(
+        f"Debug: backend_keywords in listing = {len(bk_from_listing.encode('utf-8'))} bytes"
+    )
     bk_val = st.text_area(
         "Backend Keywords",
-        value=listing.get("backend_keywords", ""),
+        value=bk_from_listing,
         height=80,
         key="cs_edit_backend_kw",
         help="Space-separated, max 249 bytes. No commas, no brand names, no repetition of words already in title or bullets.",
@@ -1971,6 +2090,41 @@ def _build_image_prompt(
             f"Close-up action shot of hands using {product_name}. "
             "Focus on the interaction between hands and product. "
             "Natural lighting, lifestyle feel. Shows ease of use."
+        ),
+        "before_after": (
+            f"Before-and-after results image for {product_name}. "
+            "Split visual clearly showing transformation outcome. "
+            "Realistic, trustworthy presentation. No exaggerated or misleading claims."
+        ),
+        "ingredients": (
+            f"Key ingredients callout image for {product_name}. "
+            "Highlight 3-5 active ingredients with clean labels and concise benefit cues. "
+            "Modern infographic style with product prominently visible."
+        ),
+        "how_to_use": (
+            f"Step-by-step how-to-use guide for {product_name}. "
+            "Three clear usage steps with simple icons and short captions. "
+            "Readable, clean layout designed for Amazon listing images."
+        ),
+        "sensory": (
+            f"Macro sensory close-up image for {product_name}. "
+            "Show texture, lather, or material detail in a premium visual style. "
+            "Soft lighting, high detail, aspirational but realistic."
+        ),
+        "certifications": (
+            f"Claims and certifications image for {product_name}. "
+            "Show product with clean badge area for certifications and standards. "
+            "Minimalist trust-focused design, no competitor references."
+        ),
+        "social_proof": (
+            f"Social proof image for {product_name}. "
+            "Present customer sentiment snippets in a tasteful, readable layout. "
+            "UGC-inspired composition with product hero focus."
+        ),
+        "variant_range": (
+            f"Variant range image for {product_name}. "
+            "Show all available variants in a cohesive lineup with consistent styling. "
+            "Clear differentiation by color, scent, or size."
         ),
     }
     return slot_prompts.get(
@@ -2188,6 +2342,100 @@ def _slot_has_image(data: dict[str, Any] | None) -> bool:
     return bool(data.get("image_bytes") or data.get("storage_path"))
 
 
+# ---------------------------------------------------------------------------
+# Per-launch slot configuration helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_slot_config_key(launch_id: int) -> str:
+    return f"cs_slot_config_{launch_id}"
+
+
+def _infer_category_overrides(product_desc: str) -> dict[int, str]:
+    """Return slot overrides based on product category keywords in the description."""
+    desc_lower = (product_desc or "").lower()
+    for keyword, overrides in CATEGORY_SLOT_OVERRIDES.items():
+        if keyword in desc_lower:
+            return overrides
+    return {}
+
+
+def _get_active_slot_types(launch_id: int, product_desc: str) -> dict[int, str]:
+    """Return the active slot-type mapping for this launch.
+
+    Precedence:
+      1. Per-launch session-state config (user choices)
+      2. Category-aware defaults inferred from product description
+      3. DEFAULT_SLOT_TYPES
+    """
+    config_key = _get_slot_config_key(launch_id)
+    if config_key not in st.session_state:
+        # Seed with defaults, then apply category overrides
+        base = dict(DEFAULT_SLOT_TYPES)
+        base.update(_infer_category_overrides(product_desc))
+        st.session_state[config_key] = base
+    return st.session_state[config_key]
+
+
+def _get_slot_info(slot_num: int, launch_id: int, product_desc: str) -> dict[str, str]:
+    """Return the resolved slot-info dict (type + catalogue metadata) for a slot."""
+    active_types = _get_active_slot_types(launch_id, product_desc)
+    type_key = active_types.get(slot_num, DEFAULT_SLOT_TYPES.get(slot_num, "lifestyle"))
+    entry = IMAGE_TYPE_CATALOGUE.get(type_key, IMAGE_TYPE_CATALOGUE["lifestyle"])
+    return {"type": type_key, **entry}
+
+
+def _render_slot_type_selector(
+    slot_num: int,
+    launch_id: int,
+    product_desc: str,
+) -> dict[str, str]:
+    """Render the type-selector dropdown for a configurable slot (2-7).
+
+    Returns the resolved slot_info for the currently selected type.
+    """
+    config_key = _get_slot_config_key(launch_id)
+    active_types = _get_active_slot_types(launch_id, product_desc)
+    current_type = active_types.get(slot_num, DEFAULT_SLOT_TYPES[slot_num])
+
+    # Build display labels for selectbox
+    type_keys = list(IMAGE_TYPE_CATALOGUE.keys())
+    # Exclude main_white_bg from configurable slots
+    type_keys = [k for k in type_keys if k != "main_white_bg"]
+    labels = [
+        f"{IMAGE_TYPE_CATALOGUE[k]['icon']} {IMAGE_TYPE_CATALOGUE[k]['name']}"
+        for k in type_keys
+    ]
+    current_idx = type_keys.index(current_type) if current_type in type_keys else 0
+
+    selected_label = st.selectbox(
+        "Image type",
+        options=labels,
+        index=current_idx,
+        key=f"cs_slot_type_select_{launch_id}_{slot_num}",
+        label_visibility="collapsed",
+        help="Choose what kind of image this slot should show.",
+    )
+    selected_type = type_keys[labels.index(selected_label)]
+
+    # Persist if changed; also reset cached prompt so it regenerates for the new type
+    if selected_type != current_type:
+        active_types[slot_num] = selected_type
+        st.session_state[config_key] = active_types
+        prompt_key = f"cs_slot_prompt_{launch_id}_{slot_num}"
+        if prompt_key in st.session_state:
+            del st.session_state[prompt_key]
+        input_key = f"{prompt_key}_input"
+        if input_key in st.session_state:
+            del st.session_state[input_key]
+        prompt_mode_input_key = f"{prompt_key}_prompt_mode_input"
+        if prompt_mode_input_key in st.session_state:
+            del st.session_state[prompt_mode_input_key]
+
+    entry = IMAGE_TYPE_CATALOGUE[selected_type]
+    return {"type": selected_type, **entry}
+
+
 def _render_image_prompt_cards(
     launch_id: int,
     product_name: str,
@@ -2198,24 +2446,32 @@ def _render_image_prompt_cards(
         "Copy each prompt below into **Gemini 3** (or any image generator) "
         "to produce an Amazon-ready image for that slot."
     )
-    for slot_num, slot_info in IMAGE_SLOTS.items():
+    total_slots = len(DEFAULT_SLOT_TYPES)
+    for slot_num in range(1, total_slots + 1):
         prompt_key = f"cs_slot_prompt_{launch_id}_{slot_num}"
-        # Initialise from builder if not yet edited
-        if prompt_key not in st.session_state:
-            st.session_state[prompt_key] = _build_image_prompt(
-                slot_info, product_name, product_desc
-            )
         with st.container(border=True):
-            hdr_col, icon_col = st.columns([10, 1])
+            slot_info = _get_slot_info(slot_num, launch_id, product_desc)
+            hdr_col, type_col = st.columns([6, 4])
             with hdr_col:
                 st.markdown(
                     f"**Slot {slot_num} — {slot_info['icon']} {slot_info['name']}**  \n"
                     f"<span style='color:grey;font-size:0.85em'>{slot_info['desc']}</span>",
                     unsafe_allow_html=True,
                 )
+            with type_col:
+                if slot_num > 1:
+                    slot_info = _render_slot_type_selector(
+                        slot_num, launch_id, product_desc
+                    )
+
+            if prompt_key not in st.session_state:
+                st.session_state[prompt_key] = _build_image_prompt(
+                    slot_info, product_name, product_desc
+                )
+
             prompt_text = st.text_area(
                 "Prompt",
-                value=st.session_state[prompt_key],
+                value=st.session_state.get(prompt_key, ""),
                 key=f"{prompt_key}_prompt_mode_input",
                 height=110,
                 label_visibility="collapsed",
@@ -2284,7 +2540,11 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
     st.session_state["cs_image_gallery"] = gallery
 
     # Render in 2-column grid
-    slot_items = list(IMAGE_SLOTS.items())
+    total_slots = len(DEFAULT_SLOT_TYPES)
+    slot_items = [
+        (slot_num, _get_slot_info(slot_num, launch_id, product_desc))
+        for slot_num in range(1, total_slots + 1)
+    ]
     for row_start in range(0, len(slot_items), 2):
         cols = st.columns(2)
         for col_idx, (slot_num, slot_info) in enumerate(
@@ -2298,14 +2558,17 @@ def _render_image_gallery(launch: dict[str, Any]) -> None:
     # Summary
     filled_slots = sum(
         1
-        for s in range(1, 8)
+        for s in range(1, total_slots + 1)
         if _slot_has_image(gallery.get(s)) or _slot_has_image(db_gallery.get(s))
     )
-    st.markdown(f"**Gallery Progress:** {filled_slots} / 7 slots filled")
-    if filled_slots < 7:
-        st.progress(filled_slots / 7.0, text=f"{filled_slots}/7 images ready")
+    st.markdown(f"**Gallery Progress:** {filled_slots} / {total_slots} slots filled")
+    if filled_slots < total_slots:
+        st.progress(
+            filled_slots / float(total_slots),
+            text=f"{filled_slots}/{total_slots} images ready",
+        )
     else:
-        st.success("✅ All 7 image slots filled!")
+        st.success(f"✅ All {total_slots} image slots filled!")
 
 
 def _render_image_slot(
@@ -2320,16 +2583,25 @@ def _render_image_slot(
     has_image = bool(slot_data.get("image_bytes") or slot_data.get("storage_path"))
     status_icon = "✅" if has_image else "⬜"
     prompt_key = f"cs_slot_prompt_{launch_id}_{slot_num}"
-    if prompt_key not in st.session_state:
-        st.session_state[prompt_key] = _build_image_prompt(
-            slot_info, product_name, product_desc
-        )
 
     with st.container(border=True):
-        st.markdown(
-            f"**{status_icon} Slot {slot_num}: {slot_info['icon']} {slot_info['name']}**"
-        )
-        st.caption(slot_info["desc"])
+        header_col, selector_col = st.columns([6, 4])
+        with header_col:
+            st.markdown(
+                f"**{status_icon} Slot {slot_num}: {slot_info['icon']} {slot_info['name']}**"
+            )
+            st.caption(slot_info["desc"])
+        with selector_col:
+            if slot_num > 1:
+                slot_info = _render_slot_type_selector(
+                    slot_num, launch_id, product_desc
+                )
+                st.caption(f"Selected: {slot_info['icon']} {slot_info['name']}")
+
+        if prompt_key not in st.session_state:
+            st.session_state[prompt_key] = _build_image_prompt(
+                slot_info, product_name, product_desc
+            )
 
         # Show image if available
         if slot_data.get("image_bytes"):
@@ -2341,7 +2613,7 @@ def _render_image_slot(
 
         # Requirements checklist
         with st.expander("📋 Requirements", expanded=False):
-            reqs = _get_slot_requirements(slot_num)
+            reqs = _get_slot_requirements(slot_info.get("type", "lifestyle"))
             for req in reqs:
                 st.markdown(f"• {req}")
 
@@ -2472,53 +2744,95 @@ def _render_image_slot(
                     st.rerun()
 
 
-def _get_slot_requirements(slot_num: int) -> list[str]:
+def _get_slot_requirements(slot_type: str) -> list[str]:
     requirements = {
-        1: [
+        "main_white_bg": [
             "Pure white background (RGB 255,255,255)",
             "Product fills 85%+ of frame",
             "No text, logos, or watermarks",
             "Min 1000x1000px, max 10,000px",
             "JPEG or PNG format",
         ],
-        2: [
+        "lifestyle": [
             "Shows product in real-world use",
             "Aspirational lifestyle setting",
             "High quality, well-lit",
             "No competitor products visible",
         ],
-        3: [
+        "infographic": [
             "Key features labeled with callouts",
             "Clean, readable typography",
             "Product clearly visible",
             "Benefits-focused messaging",
         ],
-        4: [
+        "comparison": [
             "Fair, accurate comparison",
             "No competitor brand names",
             "Clear advantage indicators",
             "Professional design",
         ],
-        5: [
+        "dimensions": [
             "Accurate measurements shown",
             "Size reference included",
             "All dimensions labeled",
             "Technical accuracy required",
         ],
-        6: [
+        "packaging": [
             "All included items visible",
             "Clean flat-lay arrangement",
             "White or neutral background",
             "Every accessory shown",
         ],
-        7: [
+        "in_use": [
             "Shows ease of use",
             "Hands/person interacting with product",
             "Natural, authentic feel",
             "Focus on user experience",
         ],
+        "before_after": [
+            "Transformation shown clearly and honestly",
+            "Consistent lighting/composition between before and after",
+            "No exaggerated or unverifiable claims",
+            "Readable labels if split-screen",
+        ],
+        "ingredients": [
+            "Key ingredients clearly named",
+            "Benefit callouts are concise and readable",
+            "Product remains prominent",
+            "Design remains clean and compliant",
+        ],
+        "how_to_use": [
+            "3-4 clear usage steps",
+            "Simple visual sequence",
+            "Readable text at mobile size",
+            "Guidance is practical and unambiguous",
+        ],
+        "sensory": [
+            "Texture/detail shown with high clarity",
+            "Premium lighting and color accuracy",
+            "Visual evokes feel/scent/experience",
+            "Product identity remains clear",
+        ],
+        "certifications": [
+            "Claims are factual and supportable",
+            "Badges/cert marks are clear but not cluttered",
+            "No misleading medical/compliance implication",
+            "Trust-focused clean layout",
+        ],
+        "social_proof": [
+            "Customer sentiment is readable and concise",
+            "No unverifiable superlative claims",
+            "Product remains hero element",
+            "Authentic, non-spammy visual style",
+        ],
+        "variant_range": [
+            "All variants are clearly differentiated",
+            "Consistent styling across variants",
+            "Variant labels are readable",
+            "Range breadth is obvious at a glance",
+        ],
     }
-    return requirements.get(slot_num, ["High quality product image"])
+    return requirements.get(slot_type, ["High quality product image"])
 
 
 def _infer_aspect_ratio(width: int, height: int) -> str:
@@ -3014,7 +3328,11 @@ def _render_aplus_engine(
                         (
                             data.get("image_bytes")
                             for slot, data in gallery.items()
-                            if IMAGE_SLOTS.get(int(slot), {}).get("type")
+                            if _get_slot_info(
+                                int(slot),
+                                launch_id,
+                                launch.get("product_description") or "",
+                            ).get("type")
                             == spec["slot_type"]
                             and data.get("image_bytes")
                         ),
@@ -3647,10 +3965,11 @@ def _render_final_review(
     launch_id = launch["launch_id"]
     gallery = st.session_state.get("cs_image_gallery", {})
     db_gallery = _load_image_gallery(launch_id)
+    total_slots = len(DEFAULT_SLOT_TYPES)
 
     filled_slots = sum(
         1
-        for s in range(1, 8)
+        for s in range(1, total_slots + 1)
         if _slot_has_image(gallery.get(s)) or _slot_has_image(db_gallery.get(s))
     )
 
@@ -3660,8 +3979,8 @@ def _render_final_review(
         "✅ Listing generated" if listing else "❌ Listing not generated": bool(
             listing
         ),
-        f"{'✅' if filled_slots == 7 else '⚠️'} Images: {filled_slots}/7 slots filled": filled_slots
-        == 7,
+        f"{'✅' if filled_slots == total_slots else '⚠️'} Images: {filled_slots}/{total_slots} slots filled": filled_slots
+        == total_slots,
         "✅ Title within 200 chars"
         if listing and len(listing.get("title", "")) <= 200
         else "❌ Title too long": listing and len(listing.get("title", "")) <= 200,
@@ -3726,7 +4045,7 @@ def _render_final_review(
         csv_payload = csv_buf.getvalue()
 
     gallery_sources: dict[int, dict[str, Any]] = {}
-    for slot_num in range(1, 8):
+    for slot_num in range(1, total_slots + 1):
         if gallery.get(slot_num):
             gallery_sources[slot_num] = dict(gallery.get(slot_num) or {})
         if db_gallery.get(slot_num):
@@ -3749,7 +4068,15 @@ def _render_final_review(
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for slot_num, img_bytes in gallery_images.items():
-                slot_name = IMAGE_SLOTS[slot_num]["name"].replace(" ", "_").lower()
+                slot_name = (
+                    _get_slot_info(
+                        slot_num,
+                        launch_id,
+                        launch.get("product_description") or "",
+                    )["name"]
+                    .replace(" ", "_")
+                    .lower()
+                )
                 zf.writestr(f"slot_{slot_num}_{slot_name}.jpg", img_bytes)
         images_zip_payload = zip_buf.getvalue()
 
@@ -3758,7 +4085,7 @@ def _render_final_review(
         f"ASIN: {launch['source_asin']}",
         f"Category: {launch.get('product_category', '-')}",
         f"Pursuit Score: {launch.get('pursuit_score', '-')} ({launch.get('pursuit_category', '-')})",
-        f"Images: {filled_slots}/7 slots filled",
+        f"Images: {filled_slots}/{len(DEFAULT_SLOT_TYPES)} slots filled",
         "",
     ]
     if listing:
@@ -3841,6 +4168,16 @@ def main() -> None:
     _render_launch_info(selected_launch)
     _hydrate_saved_creative_state(selected_launch)
     _prefill_listing_inputs(selected_launch)
+
+    # Debug: Show BST keyword pool status
+    bst_pool = st.session_state.get("cs_bst_keyword_pool", [])
+    if bst_pool:
+        st.success(f"✅ BST keyword pool loaded: {len(bst_pool)} keywords")
+    else:
+        st.error(
+            "❌ BST keyword pool is EMPTY - no keywords available for backend generation"
+        )
+
     st.divider()
 
     launch_id = selected_launch["launch_id"]
@@ -3910,16 +4247,13 @@ def main() -> None:
                         # Surface BST diagnostic info so empty-field issues are visible
                         bk_val = str(listing.get("backend_keywords") or "").strip()
                         bst_pool_used = _bst_pool or []
-                        with st.expander("🔍 BST diagnostic", expanded=not bk_val):
-                            st.write(
-                                f"**BST pool fed to Gemini** ({len(bst_pool_used)} terms):",
-                                bst_pool_used[:20],
-                            )
-                            st.write(
-                                f"**backend_keywords after normalization** "
-                                f"({len(bk_val.encode('utf-8'))} / 249 bytes):"
-                            )
-                            st.code(bk_val or "(empty)", language=None)
+                        # Store diagnostic info in session state so it persists after rerun
+                        st.session_state["cs_bst_diagnostic"] = {
+                            "pool_size": len(bst_pool_used),
+                            "pool_terms": bst_pool_used[:20],
+                            "backend_bytes": len(bk_val.encode("utf-8")),
+                            "backend_value": bk_val or "(EMPTY - this is the problem!)",
+                        }
                         st.success("✅ Listing generated!")
                         st.rerun()
 
@@ -3927,6 +4261,17 @@ def main() -> None:
         generated = st.session_state.get("cs_generated_listing")
         if generated:
             st.divider()
+            # Show BST diagnostic info if available
+            bst_diag = st.session_state.get("cs_bst_diagnostic")
+            if bst_diag:
+                with st.expander("🔍 BST Diagnostic (click to expand)", expanded=True):
+                    st.write(f"**BST pool size:** {bst_diag['pool_size']} terms")
+                    if bst_diag["pool_terms"]:
+                        st.caption(
+                            f"Sample terms: {', '.join(bst_diag['pool_terms'][:10])}"
+                        )
+                    st.write(f"**Backend keywords:** {bst_diag['backend_bytes']} bytes")
+                    st.code(bst_diag["backend_value"], language=None)
             edited = _render_listing_display(generated)
             st.session_state["cs_edited_listing"] = edited
 

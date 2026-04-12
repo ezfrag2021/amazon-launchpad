@@ -71,3 +71,39 @@ def test_effective_blocked_phrases_merges_dedupes() -> None:
     assert "gamma" in lowered
     assert "delta" in lowered
     assert lowered.count("gamma") == 1
+
+
+def test_backend_keywords_fallback_when_all_duplicates() -> None:
+    """When all backend keywords are duplicates of title/bullets, preserve them
+    rather than leaving backend_keywords empty."""
+    listing = {
+        "title": "Insulated Water Bottle for Gym",
+        "bullets": [
+            "Stainless steel",
+            "Leakproof",
+            "BPA-free",
+            "Large capacity",
+            "Easy clean",
+        ],
+        "description": "Great bottle for sports",
+        "backend_keywords": "bottle water gym stainless steel leakproof",
+    }
+    limits = {"title": 200, "bullet": 500, "description": 2000, "backend_keywords": 250}
+
+    normalized, report = normalize_listing_with_policy(
+        listing=listing,
+        marketplace="UK",
+        amazon_limits=limits,
+        enforce_policy=False,
+        blocked_phrases=[],
+    )
+
+    # Backend keywords should NOT be empty even though all words appear in title/bullets
+    assert normalized["backend_keywords"], (
+        "backend_keywords should not be empty when all tokens are duplicates"
+    )
+    # The original backend keywords should be preserved as fallback
+    assert (
+        "bottle" in normalized["backend_keywords"].lower()
+        or "water" in normalized["backend_keywords"].lower()
+    )

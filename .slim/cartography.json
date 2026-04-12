@@ -1,0 +1,52 @@
+{
+  "metadata": {
+    "version": "1.0.0",
+    "last_run": "2026-02-19T11:04:09.802822Z",
+    "root": "/mnt/amazon-launch",
+    "include_patterns": [
+      "*.py",
+      "*.sql"
+    ],
+    "exclude_patterns": [
+      "venv/**",
+      "**/__pycache__/**",
+      "tests/**",
+      "scripts/__pycache__/**",
+      "services/__pycache__/**"
+    ],
+    "exceptions": []
+  },
+  "file_hashes": {
+    "app.py": "b058c0f1957fd70b7f523beb9ba84e4f",
+    "migrations/001_launchpad_security.sql": "538f819df0cc2fb708514fe34267c8c8",
+    "migrations/002_launchpad_core_tables.sql": "0ac139cdd4f8c70785b52e27998a93e9",
+    "migrations/003_launchpad_compliance.sql": "0108b4d9d89d1dfe17f001f49032c5cc",
+    "migrations/004_launchpad_pricing.sql": "d62fc6f65d7ffa819a507e9aa236b456",
+    "migrations/005_launchpad_creative.sql": "2fc1b7bc7f3406c572b735ac5481b34d",
+    "migrations/006_launchpad_api_budget.sql": "f76822e5e28331ab14f4eeece211f84a",
+    "migrations/007_cache_jungle_scout_data.sql": "c607528ed5496f45bf7afff08a26f148",
+    "migrations/008_cache_evolution.sql": "f473736bd6c6cd81c9a0ba54d5f935a7",
+    "pages/1_Opportunity_Validator.py": "a4821249178d66e9b5fc1611afa66b00",
+    "pages/2_Compliance_Compass.py": "6a43368dd7cdfd2dd9e3b659f3b5cf1b",
+    "pages/3_Risk_Pricing_Architect.py": "dca06a2e336644f35a3d56784ea45495",
+    "pages/4_Creative_Studio.py": "f7a12bafce947145aa2a85a8422d1eab",
+    "scripts/seed_compliance_rules.py": "b8714cc5b80ccc91af8d9c7c845ca363",
+    "scripts/validate_launchpad_access.sql": "a2dd97bd6bc567340dd51ee89ddf6cfb",
+    "services/__init__.py": "75571cffb8c3b816d08191d17711e2ea",
+    "services/auth_manager.py": "0e99f3f8cf868a38f8db9c9357830d72",
+    "services/compliance_engine.py": "fa386152a86873a809ca1b74d851427f",
+    "services/db_connection.py": "803ee1782e237a41288d1b4312aed4a5",
+    "services/js_client.py": "94103368f793ee6f17e10f774d8d5b8e",
+    "services/launch_state.py": "13392b0fb63cef7758ff2d0343255be9",
+    "services/marketplace_policy.py": "c5c15a3fbaa2bdf868503b4dd9cd9fe1",
+    "services/opportunity_scorer.py": "7830fd2f08d41e64cfe9a0c3a6020332",
+    "services/pricing_engine.py": "2361cbcd091e9b3bef9d997a0086066f"
+  },
+  "folder_hashes": {
+    "services": "9858c45880154cb79734250b8dc82694",
+    ".": "ab853fcef08feb67cf75b0f454194dce",
+    "migrations": "d51019f4e490be47d0469b610537afa8",
+    "scripts": "0f5abd22aea40e69ca19c3264059f870",
+    "pages": "d0da83e7fdf2705de17fd07470887a12"
+  }
+}
