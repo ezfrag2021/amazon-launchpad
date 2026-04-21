@@ -12,9 +12,9 @@ RUN groupadd --system appgroup && useradd --system --gid appgroup --home-dir /ap
 COPY --chown=appuser:appgroup . .
 
 EXPOSE 8501
+EXPOSE 8503
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+    CMD curl --fail http://localhost:8503/_stcore/health || exit 1
 
-USER appuser
-CMD ["streamlit", "run", "Home.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+CMD ["streamlit", "run", "Home.py", "--server.port=8503", "--server.address=0.0.0.0", "--server.headless=true"]
