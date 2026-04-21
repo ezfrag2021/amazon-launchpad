@@ -11,7 +11,6 @@ RUN groupadd --system appgroup && useradd --system --gid appgroup --home-dir /ap
 
 COPY --chown=appuser:appgroup . .
 
-EXPOSE 8501
 EXPOSE 8503
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
