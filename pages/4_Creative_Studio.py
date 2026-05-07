@@ -27,7 +27,11 @@ from dotenv import load_dotenv
 from psycopg import errors
 from psycopg.rows import dict_row
 
-from services.auth_manager import get_generative_client, get_vertex_genai_client
+from services.auth_manager import (
+    get_generative_client,
+    get_vertex_genai_client,
+    resolve_gemini_model,
+)
 from services.creative_gallery import (
     image_gallery_supports_binary,
     load_image_gallery,
@@ -41,6 +45,11 @@ from services.imagen_quota import (
     seconds_until_next_image_request as quota_seconds_until_next_request,
 )
 from services.golden_three_client import build_keywords_string, fetch_golden_three
+from services.intelligence_reports import (
+    fetch_intelligence_report,
+    list_intelligence_reports,
+    match_report_to_launch,
+)
 from services.launch_state import WORKFLOW_ASIN_IMPROVEMENT, LaunchStateManager
 from services import sp_api_listings as _sp_api
 from services.asin_snapshot import load_asin_snapshot
@@ -235,7 +244,7 @@ AMAZON_LIMITS = {
 # Load environment variables
 load_dotenv()
 
-GEMINI_MODEL = os.getenv("CREATIVE_GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = resolve_gemini_model("CREATIVE_GEMINI_MODEL", "LAUNCHPAD_GEMINI_MODEL")
 IMAGEN_MODEL = os.getenv("CREATIVE_IMAGEN_MODEL", "imagen-3.0-generate-002")
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
 IMAGEN_RETRY_MAX_ATTEMPTS = max(0, int(os.getenv("CREATIVE_IMAGEN_MAX_RETRIES", "4")))
@@ -332,6 +341,7 @@ def _init_session_state() -> None:
         "cs_launch_data": None,
         # Listing generation
         "cs_product_name": "",
+        "cs_brand_name": "",
         "cs_key_features": "",
         "cs_target_keywords": "",
         "cs_brand_voice": "Professional",
@@ -365,6 +375,11 @@ def _init_session_state() -> None:
         "cs_golden_three_launch_id": None,
         # PPC/JS keyword pool for BST seeding (list of str)
         "cs_bst_keyword_pool": [],
+        # Intelligence report (niche analysis from Drive)
+        "cs_intelligence_report_id": None,
+        "cs_intelligence_report_name": None,
+        "cs_intelligence_report_content": None,
+        "cs_intelligence_reports_loaded": False,
         # SP-API push state — marketplace-scoped keys are created dynamically
         # in _render_push_to_amazon; nothing to pre-init here.
     }
@@ -869,6 +884,7 @@ def _build_opportunity_snapshot(
                         FROM market_intel.niche_keyword_bank
                         WHERE source_asin = %s
                           AND keyword IS NOT NULL
+                          AND is_selected IS TRUE
                         ORDER BY monthly_search_volume_exact DESC NULLS LAST
                         LIMIT 60
                         """,
@@ -1050,6 +1066,125 @@ def _prefill_listing_inputs(launch: dict[str, Any]) -> None:
         st.session_state["cs_key_features_input"] = generated_features
 
 
+def _load_and_select_intelligence_report(launch: dict[str, Any]) -> None:
+    """Load available intelligence reports, auto-match, and render selector.
+
+    Stores the selected report ID, name, and full content in session state
+    under cs_intelligence_report_* keys so the generate flow can inject it
+    into the listing prompt.
+    """
+    launch_id = int(launch["launch_id"])
+
+    st.divider()
+    st.subheader("📊 Intelligence Report")
+
+    refresh_requested = st.button(
+        "🔄 Refresh report list",
+        key=f"cs_refresh_reports_{launch_id}",
+        help="Reload the Google Drive report folder if a new report is missing.",
+    )
+
+    # Only list reports once per launch/session, but bust the service-level cache
+    # when switching launches or when the user explicitly refreshes.
+    if refresh_requested or not st.session_state.get("cs_intelligence_reports_loaded"):
+        try:
+            reports = list_intelligence_reports(force_refresh=True)
+        except Exception as exc:
+            logger.warning("Could not list intelligence reports: %s", exc)
+            reports = []
+        st.session_state["cs_intelligence_reports_loaded"] = True
+        st.session_state["cs_intelligence_reports"] = reports
+
+        # Auto-match on first load for this launch.
+        product_desc = str(launch.get("product_description") or "")
+        matched = match_report_to_launch(product_desc, reports)
+        if matched and not st.session_state.get("cs_intelligence_report_id"):
+            try:
+                content = fetch_intelligence_report(matched["id"])
+                st.session_state["cs_intelligence_report_id"] = matched["id"]
+                st.session_state["cs_intelligence_report_name"] = matched["niche_label"]
+                st.session_state["cs_intelligence_report_content"] = content
+            except Exception as exc:
+                logger.warning("Could not fetch matched report: %s", exc)
+    else:
+        reports = st.session_state.get("cs_intelligence_reports", [])
+
+    if not reports:
+        st.warning(
+            "No intelligence reports found in Drive. "
+            "Run a niche analysis first to populate the "
+            "'New Product Opportunity Reports' folder."
+        )
+        return
+
+    # Build selector options.
+    options: dict[str, str] = {}
+    for r in reports:
+        label = f"{r['niche_label']} ({r['marketplace']})"
+        options[label] = r["id"]
+
+    current_id = st.session_state.get("cs_intelligence_report_id")
+    current_name = st.session_state.get("cs_intelligence_report_name")
+    current_marketplace = ""
+    if current_id:
+        for r in reports:
+            if r["id"] == current_id:
+                current_marketplace = r.get("marketplace", "")
+                break
+
+    matched = match_report_to_launch(
+        str(launch.get("product_description") or ""), reports
+    )
+    if matched and matched["id"] == current_id:
+        st.success(f"Auto-matched: **{matched['niche_label']}**")
+    elif matched:
+        st.info(
+            f"Best match found: **{matched['niche_label']}** "
+            "(select below to load)"
+        )
+
+    select_options = ["(none)"] + list(options.keys())
+    current_index = 0
+    if current_id in options.values():
+        current_label = next(
+            (k for k, v in options.items() if v == current_id), ""
+        )
+        if current_label in select_options:
+            current_index = select_options.index(current_label)
+
+    selected_label = st.selectbox(
+        "Niche intelligence report",
+        options=select_options,
+        index=current_index,
+        key="cs_report_selector",
+        help=(
+            "Import product launch intelligence to inform listing generation. "
+            "Auto-matched by product description. Select '(none)' to skip."
+        ),
+    )
+
+    if not selected_label or selected_label == "(none)":
+        st.session_state["cs_intelligence_report_id"] = None
+        st.session_state["cs_intelligence_report_name"] = None
+        st.session_state["cs_intelligence_report_content"] = None
+        return
+
+    selected_id = options.get(selected_label)
+    if selected_id == current_id and st.session_state.get("cs_intelligence_report_content"):
+        return
+
+    if selected_id:
+        with st.spinner("📥 Loading intelligence report..."):
+            try:
+                content = fetch_intelligence_report(selected_id)
+                st.session_state["cs_intelligence_report_id"] = selected_id
+                st.session_state["cs_intelligence_report_name"] = selected_label
+                st.session_state["cs_intelligence_report_content"] = content
+            except Exception as exc:
+                st.error(f"Failed to load report: {exc}")
+                logger.error("Report fetch error: %s", exc)
+
+
 def _reset_launch_scoped_state(launch: dict[str, Any]) -> None:
     """Reset launch-scoped creative state when switching launches."""
     launch_id = int(launch["launch_id"])
@@ -1063,6 +1198,7 @@ def _reset_launch_scoped_state(launch: dict[str, Any]) -> None:
     st.session_state["cs_key_features_prefill_attempted_launch_id"] = None
 
     st.session_state["cs_product_name"] = ""
+    st.session_state["cs_brand_name"] = ""
     st.session_state["cs_key_features"] = ""
     st.session_state["cs_target_keywords"] = ""
     st.session_state["cs_generated_listing"] = None
@@ -1078,6 +1214,10 @@ def _reset_launch_scoped_state(launch: dict[str, Any]) -> None:
     st.session_state["cs_golden_three"] = None
     st.session_state["cs_golden_three_launch_id"] = None
     st.session_state["cs_bst_keyword_pool"] = []
+    st.session_state["cs_intelligence_report_id"] = None
+    st.session_state["cs_intelligence_report_name"] = None
+    st.session_state["cs_intelligence_report_content"] = None
+    st.session_state["cs_intelligence_reports_loaded"] = False
     # Clear push state — marketplace-scoped keys are cleared by prefix
     push_keys = [
         k for k in st.session_state if k.startswith("cs_push_") or k == "cs_seller_id"
@@ -1087,12 +1227,31 @@ def _reset_launch_scoped_state(launch: dict[str, Any]) -> None:
 
     for key in (
         "cs_product_name_input",
+        "cs_brand_name_input",
         "cs_key_features_input",
         "cs_target_keywords_input",
     ):
         st.session_state.pop(key, None)
 
     _reset_listing_editor_state()
+
+
+def _set_listing_editor_values(listing: dict[str, Any]) -> None:
+    """Set listing editor widget state to the given listing values.
+
+    Streamlit retains widget state separately from the value= parameter,
+    so popping keys and relying on value= does not reliably update widgets
+    on rerun.  Direct assignment ensures the rendered text areas show the
+    correct content.
+    """
+    st.session_state["cs_edit_title"] = listing.get("title", "")
+    st.session_state["cs_edit_description"] = listing.get("description", "")
+    st.session_state["cs_edit_backend_kw"] = listing.get("backend_keywords", "")
+    bullets = listing.get("bullets") or [""] * 5
+    for idx in range(5):
+        st.session_state[f"cs_edit_bullet_{idx}"] = (
+            str(bullets[idx]).strip() if idx < len(bullets) else ""
+        )
 
 
 def _reset_listing_editor_state() -> None:
@@ -1182,11 +1341,15 @@ def _hydrate_saved_creative_state(launch: dict[str, Any]) -> None:
                     )
 
             if snapshot_listing:
+                snap_brand = str(snapshot_listing.get("brand") or "").strip()
                 snap_bullets = snapshot_listing.get("bullets") or []
                 if not isinstance(snap_bullets, list):
                     snap_bullets = []
                 snap_bk = str(snapshot_listing.get("backend_keywords") or "").strip()
                 snap_title = str(snapshot_listing.get("title") or "").strip()
+                if snap_brand and not st.session_state.get("cs_brand_name"):
+                    st.session_state["cs_brand_name"] = snap_brand
+                    st.session_state["cs_brand_name_input"] = snap_brand
                 restored = {
                     "title": snap_title,
                     "bullets": snap_bullets,
@@ -1345,6 +1508,10 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
 
     launch_description = launch.get("product_description") or ""
 
+    if "cs_brand_name_input" not in st.session_state:
+        st.session_state["cs_brand_name_input"] = st.session_state.get(
+            "cs_brand_name", ""
+        )
     if "cs_product_name_input" not in st.session_state:
         st.session_state["cs_product_name_input"] = (
             st.session_state.get("cs_product_name") or launch_description[:100]
@@ -1365,9 +1532,18 @@ def _render_listing_inputs(launch: dict[str, Any]) -> None:
     col1, col2 = st.columns(2)
 
     with col1:
+        brand_name = st.text_input(
+            "Brand Name",
+            value=st.session_state.get("cs_brand_name", ""),
+            placeholder="e.g. Dai Wang",
+            key="cs_brand_name_input",
+            help="Auto-populated from ASIN snapshot. Edit to use a shorter trading name for the title.",
+        )
+        st.session_state["cs_brand_name"] = brand_name
+
         product_name = st.text_input(
             "Product Name / Title",
-            placeholder="e.g. Premium Stainless Steel Water Bottle 32oz",
+            placeholder="e.g. Korean Ginseng Tea - High Strength Panax Root Extract",
             key="cs_product_name_input",
             help="Auto-populated from Module 1 product description.",
         )
@@ -1614,6 +1790,10 @@ def _build_listing_prompt(
     blocked_phrases: list[str] | None = None,
     extra_instruction: str = "",
     bst_keyword_pool: list[str] | None = None,
+    product_description: str = "",
+    keyword_priorities: list[dict[str, Any]] | None = None,
+    intelligence_report: str = "",
+    brand_name: str = "",
 ) -> str:
     voice_desc = {
         "Professional": "authoritative, clear, and business-like",
@@ -1649,39 +1829,80 @@ RUFUS AI OPTIMIZATION:
         pool_str = " ".join(bst_keyword_pool[:60])  # cap to avoid prompt bloat
         bst_pool_block = f"\nBST KEYWORD POOL (long-tail candidates for backend_keywords):\n{pool_str}\n"
 
-    return f"""You are an expert Amazon listing copywriter specializing in {marketplace} marketplace.
-Write a complete, optimized Amazon product listing in a {voice_desc} brand voice.
+    product_context_block = ""
+    if product_description.strip():
+        product_context_block = f"\nPRODUCT CONTEXT (background from product analysis):\n{product_description.strip()}\n"
 
-PRODUCT: {product_name}
-KEY FEATURES:
+    intelligence_report_block = ""
+    if intelligence_report.strip():
+        intelligence_report_block = (
+            "\nLAUNCH INTELLIGENCE REPORT (the authoritative source for this listing):\n"
+            f"{intelligence_report.strip()[:18000]}\n"
+        )
+
+    keyword_priorities_block = ""
+    if keyword_priorities:
+        lines = []
+        for i, kp in enumerate(keyword_priorities):
+            kw = str(kp.get("keyword") or "").strip()
+            vol = kp.get("search_volume")
+            vol_str = f" ({vol:,} searches/month)" if isinstance(vol, (int, float)) and vol > 0 else ""
+            label = " — PRIMARY (must appear in title)" if i == 0 else ""
+            lines.append(f"  {i + 1}. {kw}{vol_str}{label}")
+        if lines:
+            keyword_priorities_block = (
+                "\nKEYWORD PRIORITIES (ordered by importance — highest first):\n"
+                + "\n".join(lines)
+                + "\n"
+            )
+
+    return f"""You are an expert Amazon listing copywriter specializing in the {marketplace} marketplace.
+{intelligence_report_block}
+The input below may be an existing draft listing or raw product information. Your job is to produce a significantly improved final version — not to reproduce or lightly rephrase what you see. Write fresh, benefit-driven copy in a {voice_desc} brand voice.{product_context_block}
+
+DRAFT TITLE / PRODUCT NAME: {product_name}
+
+DRAFT FEATURES / RAW INFO:
 {key_features}
 
-TARGET KEYWORDS: {target_keywords}
+TARGET KEYWORDS: {target_keywords}{keyword_priorities_block}
 {rufus_note}
 {bst_pool_block}
 {extra_instruction_block}
 
+IMPROVEMENT GUIDELINES:
+- Use the Launch Intelligence Report above as your primary strategic guide. Align the listing with the report's market positioning, value-vacuum pricing insights, competitor weaknesses, and keyword recommendations.
+- You are NOT proofreading — you are REWRITING. A semantically identical bullet is a failed bullet.
+- TITLE FORMAT: "{{brand_name}} {{2-5 key product/use words}} - {{rest of title}}". The text BEFORE the dash sets the Amazon URL slug — make every word count for SEO. Use {{brand_name}} (or if only a first name / trading name was given, use ONLY that — strip suffixes like "Pharmaceutical Co Ltd" or "LLC" or "Inc"). Fill the pre-dash space with the product type and the highest-volume keyword. Everything after the dash is the selling pitch.
+- Title total: max 200 characters. Primary keyword in the pre-dash portion.
+- Bullets: Each must open with a distinct benefit angle in ALL CAPS. If any two bullets make overlapping claims, pick the stronger one and replace the weaker one entirely. Use different vocabulary from the draft — if the draft says "BPA-free" say "food-grade purity," if it says "durable" say "built to outlast."
+- Description: Write plain-text original prose (NO HTML). Use paragraph breaks with blank lines. Address price-justification (value vacuum positioning), overcome competitor-identified weaknesses, and paint the post-purchase transformation.
+- Backend keywords: Mine the intelligence report for search terms NOT in the draft. Fill as close to 249 bytes as possible.
+
 OUTPUT FORMAT (respond with valid JSON only, no markdown):
 {{
-  "title": "Optimized product title (max 200 characters, include primary keyword near start)",
-  "bullets": [
-    "Bullet 1 (max 500 chars, start with ALL CAPS benefit, include keyword)",
-    "Bullet 2 (max 500 chars)",
-    "Bullet 3 (max 500 chars)",
-    "Bullet 4 (max 500 chars)",
-    "Bullet 5 (max 500 chars)"
+  "title": "Improved title (max 200 chars)",
+  "bullets": ["Bullet 1", "Bullet 2", "Bullet 3", "Bullet 4", "Bullet 5"],
+  "description": "Plain-text product description (max 2000 chars, NO HTML tags)",
+  "backend_keywords": "Space-separated backend search terms",
+  "changes_made": [
+    "Title: <what was changed and why — reference the intelligence report>",
+    "Bullets: <what was changed from the draft and why>",
+    "Description: <what was changed from the draft and why>",
+    "BST: <search terms added based on report insights>"
   ],
-  "description": "HTML-formatted product description (max 2000 chars, use <b> and <br> tags)",
-  "backend_keywords": "Space-separated backend search terms — see BST RULES below",
-  "quality_score": 85,
-  "quality_notes": ["Note 1", "Note 2"],
-  "optimization_suggestions": ["Suggestion 1", "Suggestion 2"]
+  "quality_score": 85
 }}
 
-RULES:
+CRITICAL RULES — failure to follow these means the output is worthless:
+- If you reproduce the draft text verbatim you have FAILED. Every field must differ materially from the draft.
+- Title MUST NOT match the draft title. Reorder keywords, reposition the benefit, change the structure.
+- Each bullet MUST make a claim NOT made in the draft. If the draft says "BPA-free stainless steel" you could say "Crafted from surgical-grade 18/8 steel for lifelong purity" — same feature, entirely different copy.
+- Description MUST be original prose, not a rewrite. Use insights from the intelligence report: price positioning, competitor gaps, buyer objections identified in the analysis.
+- changes_made MUST list concrete differences between draft and output for each field. Be specific about what changed.
 - Title: max 200 characters, primary keyword in first 80 chars
 - Each bullet: max 500 characters, start with capitalized benefit phrase
-- Description: HTML formatted, max 2000 characters
+- Description: plain text only, max 2000 characters — Amazon forbids HTML tags (no <b>, <br>, <p>, <h1>, etc.)
 - quality_score: integer 0-100 based on keyword density, readability, compliance
 - Do NOT include markdown code blocks in response, return raw JSON only
 - Prohibited words/phrases that must NOT appear in title, bullets, description, or backend keywords:
@@ -1713,6 +1934,9 @@ def _generate_listing(
     marketplace: str = "UK",
     extra_instruction: str = "",
     bst_keyword_pool: list[str] | None = None,
+    product_description: str = "",
+    intelligence_report: str = "",
+    brand_name: str = "",
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Generate listing and return (normalized_listing, policy_report)."""
     try:
@@ -1729,13 +1953,30 @@ def _generate_listing(
             _effective_blocked_phrases(marketplace),
             extra_instruction,
             bst_keyword_pool,
+            product_description,
+            intelligence_report=intelligence_report,
+            brand_name=brand_name,
+        )
+        logger.info(
+            "Generate input — product_name: %r  features_len: %d  keywords: %r  report_len: %d",
+            product_name[:100],
+            len(key_features),
+            target_keywords[:80],
+            len(intelligence_report) if intelligence_report else 0,
         )
 
         response = model.generate_content(prompt)
-        parsed = _parse_json_object_from_text(str(getattr(response, "text", "") or ""))
+        raw_text = str(getattr(response, "text", "") or "")
+        parsed = _parse_json_object_from_text(raw_text)
         if not isinstance(parsed, dict):
             st.error("❌ AI response did not match expected listing object.")
             return None, None
+        logger.info(
+            "Gemini raw — title: %r  bullet[0]: %r  desc_len: %d",
+            str(parsed.get("title") or "")[:100],
+            (str(parsed.get("bullets") or [""])[0] or "")[:100],
+            len(str(parsed.get("description") or "")),
+        )
         raw_bk = str(parsed.get("backend_keywords") or "").strip()
         logger.info(
             "Gemini raw backend_keywords (%d chars): %r",
@@ -1743,6 +1984,11 @@ def _generate_listing(
             raw_bk[:120],
         )
         normalized, report = _normalize_listing_with_policy(parsed, marketplace)
+        logger.info(
+            "Post-normalize — title: %r  bullet[0]: %r",
+            str(normalized.get("title") or "")[:100],
+            (str(normalized.get("bullets") or [""])[0] or "")[:100],
+        )
         post_bk = str(normalized.get("backend_keywords") or "").strip()
         logger.info(
             "Post-normalization backend_keywords (%d chars / %d bytes): %r",
@@ -4168,6 +4414,7 @@ def main() -> None:
     _render_launch_info(selected_launch)
     _hydrate_saved_creative_state(selected_launch)
     _prefill_listing_inputs(selected_launch)
+    _load_and_select_intelligence_report(selected_launch)
 
     # Debug: Show BST keyword pool status
     bst_pool = st.session_state.get("cs_bst_keyword_pool", [])
@@ -4236,9 +4483,16 @@ def main() -> None:
                                 "cs_listing_extra_instruction", ""
                             ),
                             bst_keyword_pool=_bst_pool or None,
+                            product_description=str(
+                                selected_launch.get("product_description") or ""
+                            ).strip(),
+                            intelligence_report=st.session_state.get(
+                                "cs_intelligence_report_content"
+                            ) or "",
+                            brand_name=st.session_state.get("cs_brand_name", ""),
                         )
                     if listing:
-                        _reset_listing_editor_state()
+                        _set_listing_editor_values(listing)
                         st.session_state["cs_generated_listing"] = listing
                         st.session_state["cs_edited_listing"] = listing
                         st.session_state["cs_listing_policy_report"] = (
@@ -4359,6 +4613,13 @@ def main() -> None:
                                     "cs_listing_extra_instruction", ""
                                 ),
                                 bst_keyword_pool=_bst_pool or None,
+                                product_description=str(
+                                    selected_launch.get("product_description") or ""
+                                ).strip(),
+                                intelligence_report=st.session_state.get(
+                                    "cs_intelligence_report_content"
+                                ) or "",
+                                brand_name=st.session_state.get("cs_brand_name", ""),
                             )
                         if mp_listing:
                             st.session_state[f"cs_listing_{mp}"] = mp_listing

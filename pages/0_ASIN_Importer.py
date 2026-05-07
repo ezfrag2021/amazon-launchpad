@@ -365,6 +365,7 @@ def _fetch_backend_keywords_from_niche_bank(
                 FROM market_intel.niche_keyword_bank
                 WHERE source_asin = %s
                   AND keyword IS NOT NULL
+                  AND is_selected IS TRUE
                 ORDER BY monthly_search_volume_exact DESC NULLS LAST
                 LIMIT 60
                 """,
